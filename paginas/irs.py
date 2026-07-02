@@ -102,13 +102,19 @@ with tab_processar:
         up_liq = st.file_uploader("Nota de Liquidação (PDF)", type=["pdf"], key=f"up_liq_irs_{nif_escolhido}")
         dados_liq = None
         if up_liq is not None:
-            dados_liq = extrair_dados_liquidacao_irs(up_liq.getvalue())
-            if dados_liq["nif"] and dados_liq["nif"] != nif_escolhido:
-                st.warning(f"⚠️ O NIF encontrado no PDF ({dados_liq['nif']}) não corresponde ao cliente selecionado ({nif_escolhido}). Confirma que carregaste o ficheiro certo.")
+            dados_liq = extrair_dados_liquidacao_irs(up_liq.getvalue(), nif_esperado=nif_escolhido)
+            if dados_liq["nif_confirmado"] is False:
+                st.warning(
+                    f"⚠️ Não encontrei o NIF do cliente selecionado ({nif_escolhido}) neste PDF. "
+                    "Confirma que carregaste o ficheiro certo."
+                )
             if dados_liq["valor_apurado"] is None:
-                st.warning("Não consegui ler o valor apurado automaticamente neste PDF — preenche manualmente abaixo.")
+                st.warning("Não consegui ler o valor automaticamente neste PDF — preenche manualmente abaixo.")
             else:
-                st.success(f"Valor apurado lido: {dados_liq['valor_apurado']:,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
+                rotulo_legivel = {"a pagar": "a pagar", "a receber": "a receber (reembolso)", "apurado": "apurado (sem valor a pagar/receber)"}.get(dados_liq["tipo_valor"], "")
+                st.success(
+                    f"Valor {rotulo_legivel}: {abs(dados_liq['valor_apurado']):,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+                )
 
     with col_p:
         up_pend = st.file_uploader("Controlo de Pendentes (PDF, opcional)", type=["pdf"], key=f"up_pend_irs_{nif_escolhido}")
