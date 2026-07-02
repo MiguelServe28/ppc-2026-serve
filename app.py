@@ -1,17 +1,27 @@
 """
 Gestão de Pagamentos por Conta 2026 — SERVE
-Fluxo completo: importar clientes -> calcular PPC -> associar guias -> gerar e enviar emails -> exportar.
+Fluxo completo: login por gestor -> importar clientes -> calcular PPC -> associar guias
+-> gerar e enviar emails -> exportar.
+
+Base de dados: Supabase (Postgres), com Row Level Security — cada gestor só vê e edita
+os clientes que lhe estão atribuídos (campo Gestor_Email); o admin vê tudo.
 
 Correr com:  streamlit run app.py
+
+Configuração necessária em .streamlit/secrets.toml (local) ou em
+Settings → Secrets (Streamlit Community Cloud):
+
+    SUPABASE_URL = "https://XXXXXXXX.supabase.co"
+    SUPABASE_ANON_KEY = "a chave 'anon public' do projeto"
+    SUPABASE_SERVICE_KEY = "a chave 'service_role' do projeto"   # opcional, só o admin precisa
+
+Ver GUIA_SUPABASE.md para o processo completo passo a passo.
 """
 
 import io
-import json
 import math
-import os
 import re
 import smtplib
-import sqlite3
 import ssl
 from datetime import date, datetime
 from email.mime.application import MIMEApplication
@@ -23,42 +33,12 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from supabase import Client, create_client
 
 # ---------------------------------------------------------------------------
 # Configuração geral
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Pagamentos por Conta 2026", layout="wide", page_icon="💶")
-
-# ---------------------------------------------------------------------------
-# Proteção por password
-# ---------------------------------------------------------------------------
-def verificar_password():
-    """Mostra um ecrã de login simples. A password fica em st.secrets['APP_PASSWORD'],
-    nunca no código. Localmente (sem secrets.toml configurado), a app corre sem pedir password."""
-    try:
-        tem_password_configurada = "APP_PASSWORD" in st.secrets
-    except Exception:
-        tem_password_configurada = False
-
-    if not tem_password_configurada:
-        return True  # execução local sem secrets.toml configurado — não bloqueia
-
-    if st.session_state.get("autenticado", False):
-        return True
-
-    st.title("🔒 Pagamentos por Conta 2026")
-    pwd = st.text_input("Password de acesso", type="password")
-    if st.button("Entrar"):
-        if pwd == st.secrets["APP_PASSWORD"]:
-            st.session_state["autenticado"] = True
-            st.rerun()
-        else:
-            st.error("Password incorreta.")
-    return False
-
-
-if not verificar_password():
-    st.stop()
 
 CLIENT_COLS = [
     "NIF", "Nome", "Email",
@@ -70,6 +50,19 @@ CLIENT_COLS = [
 ]
 BOOL_COLS = [c for c in CLIENT_COLS if c.startswith("Guia") or c.startswith("Email") and c.endswith(("Emitida", "Enviado"))]
 TEXT_COLS = ["NIF", "Nome", "Email", "Gestor_Nome", "Gestor_Email", "Notas"]
+
+# Mapeamento entre os nomes de colunas usados na app (iguais aos de sempre) e os
+# nomes das colunas na base de dados Postgres (o Postgres normaliza tudo para
+# minúsculas, por isso a tabela "clientes" no Supabase usa nomes em minúsculas).
+COLUMN_MAP_TO_DB = {
+    "NIF": "nif", "Nome": "nome", "Email": "email",
+    "Gestor_Nome": "gestor_nome", "Gestor_Email": "gestor_email",
+    "Volume_2025": "volume_2025", "Coleta_2025": "coleta_2025", "Retencoes_2025": "retencoes_2025",
+    "Guia1_Emitida": "guia1_emitida", "Guia2_Emitida": "guia2_emitida", "Guia3_Emitida": "guia3_emitida",
+    "Email1_Enviado": "email1_enviado", "Email2_Enviado": "email2_enviado", "Email3_Enviado": "email3_enviado",
+    "Notas": "notas",
+}
+COLUMN_MAP_FROM_DB = {v: k for k, v in COLUMN_MAP_TO_DB.items()}
 
 DEFAULT_TEMPLATES = {
     1: {
@@ -114,140 +107,153 @@ DEFAULT_TEMPLATES = {
 }
 
 # ---------------------------------------------------------------------------
-# Persistência (SQLite local — sobrevive a fechar o browser / reiniciar a app)
+# Ligação ao Supabase
 # ---------------------------------------------------------------------------
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ppc_data.db")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_KEY = st.secrets.get("SUPABASE_SERVICE_KEY")  # só necessário para o admin criar gestores
 
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_client() -> Client:
+    """Devolve o cliente Supabase desta sessão de browser (um por utilizador —
+    nunca partilhado entre utilizadores, para que a sessão de autenticação de
+    cada um não se misture com a de outro)."""
+    if "sb_client" not in st.session_state:
+        st.session_state.sb_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    return st.session_state.sb_client
 
 
-def init_db():
-    conn = get_conn()
-    conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS clientes (
-            NIF TEXT PRIMARY KEY, Nome TEXT, Email TEXT,
-            Gestor_Nome TEXT, Gestor_Email TEXT,
-            Volume_2025 REAL, Coleta_2025 REAL, Retencoes_2025 REAL,
-            Guia1_Emitida INTEGER, Guia2_Emitida INTEGER, Guia3_Emitida INTEGER,
-            Email1_Enviado INTEGER, Email2_Enviado INTEGER, Email3_Enviado INTEGER,
-            Notas TEXT
+def get_admin_client() -> Client | None:
+    """Cliente com a chave 'service_role' — só usado nas ações de administração
+    de contas (criar gestores). Nunca deve ser usado para ler/escrever clientes."""
+    if not SUPABASE_SERVICE_KEY:
+        return None
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Autenticação e perfil (admin vs. gestor)
+# ---------------------------------------------------------------------------
+def carregar_perfil():
+    client = get_client()
+    user_id = st.session_state.user.id
+    resp = client.table("perfis").select("*").eq("id", user_id).execute()
+    if resp.data:
+        st.session_state.perfil = resp.data[0]
+    else:
+        # Ainda não existe perfil (não devia acontecer, o trigger cria-o) — usa um por omissão seguro.
+        st.session_state.perfil = {"id": user_id, "email": st.session_state.user.email, "nome": st.session_state.user.email, "role": "gestor"}
+
+
+def ecra_login():
+    st.title("🔒 Gestão de Pagamentos por Conta 2026")
+    st.caption("SERVE — Contabilidade e Viabilização Empresarial. Inicia sessão com a tua conta de gestor.")
+
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        st.error(
+            "A app ainda não está ligada ao Supabase. Falta configurar SUPABASE_URL e "
+            "SUPABASE_ANON_KEY em Settings → Secrets. Ver GUIA_SUPABASE.md."
         )
-    """)
-    # Migração: se a tabela já existia sem as colunas de Gestor, adiciona-as agora
-    colunas_existentes = {row[1] for row in conn.execute("PRAGMA table_info(clientes)").fetchall()}
-    for coluna in ("Gestor_Nome", "Gestor_Email"):
-        if coluna not in colunas_existentes:
-            conn.execute(f"ALTER TABLE clientes ADD COLUMN {coluna} TEXT DEFAULT ''")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS log_envios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TEXT, nif TEXT, nome TEXT, pagamento INTEGER, estado TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS config (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            params_json TEXT, templates_json TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+        st.stop()
+
+    email = st.text_input("Email")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Entrar", type="primary"):
+        try:
+            client = get_client()
+            res = client.auth.sign_in_with_password({"email": email, "password": pwd})
+            st.session_state.user = res.user
+            carregar_perfil()
+            st.rerun()
+        except Exception:
+            st.error("Email ou password incorretos.")
 
 
-def carregar_config_db():
-    conn = get_conn()
-    try:
-        row = conn.execute("SELECT params_json, templates_json FROM config WHERE id=1").fetchone()
-    finally:
-        conn.close()
-    if not row:
-        return None, None
-    params_json, templates_json = row
-    params, templates = None, None
-    if params_json:
-        raw = json.loads(params_json)
-        params = {
-            "limiar_volume": raw["limiar_volume"], "taxa_baixa": raw["taxa_baixa"],
-            "taxa_alta": raw["taxa_alta"], "limite_dispensa": raw["limite_dispensa"],
-            "data1": date.fromisoformat(raw["data1"]), "data2": date.fromisoformat(raw["data2"]),
-            "data3": date.fromisoformat(raw["data3"]),
-        }
-    if templates_json:
-        templates = {int(k): v for k, v in json.loads(templates_json).items()}
-    return params, templates
+def sidebar_utilizador():
+    perfil = st.session_state.perfil
+    with st.sidebar:
+        papel = "Administrador" if perfil["role"] == "admin" else "Gestor"
+        st.success(f"👤 {perfil['nome'] or perfil['email']}  \n**{papel}**")
+        if st.button("Sair"):
+            try:
+                get_client().auth.sign_out()
+            except Exception:
+                pass
+            for k in ("user", "perfil", "sb_client"):
+                st.session_state.pop(k, None)
+            st.rerun()
+        st.divider()
 
 
-def guardar_config_db(params: dict, templates: dict):
-    params_serializ = dict(params)
-    for k in ("data1", "data2", "data3"):
-        params_serializ[k] = params[k].isoformat()
-    conn = get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO config (id, params_json, templates_json) VALUES (1, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET params_json=excluded.params_json, templates_json=excluded.templates_json",
-            (json.dumps(params_serializ), json.dumps(templates)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+if "user" not in st.session_state:
+    ecra_login()
+    st.stop()
 
+sou_admin = st.session_state.perfil["role"] == "admin"
+meu_email_login = st.session_state.perfil["email"]
 
+# ---------------------------------------------------------------------------
+# Persistência (Supabase — a RLS garante que cada gestor só vê/edita a sua carteira)
+# ---------------------------------------------------------------------------
 def carregar_clientes_db() -> pd.DataFrame:
-    conn = get_conn()
-    try:
-        df = pd.read_sql_query("SELECT * FROM clientes", conn)
-    finally:
-        conn.close()
-    if df.empty:
+    client = get_client()
+    resp = client.table("clientes").select("*").execute()
+    rows = resp.data or []
+    if not rows:
         return pd.DataFrame(columns=CLIENT_COLS)
+    df = pd.DataFrame(rows).rename(columns=COLUMN_MAP_FROM_DB)
+    for c in CLIENT_COLS:
+        if c not in df.columns:
+            df[c] = False if c in BOOL_COLS else ("" if c in TEXT_COLS else 0.0)
     for c in BOOL_COLS:
-        df[c] = df[c].astype(bool)
+        df[c] = df[c].fillna(False).astype(bool)
     return df[CLIENT_COLS]
 
 
 def guardar_clientes_db(df: pd.DataFrame):
-    conn = get_conn()
-    try:
-        df2 = clean_df(df).copy()
-        for c in BOOL_COLS:
-            df2[c] = df2[c].astype(int)
-        conn.execute("DELETE FROM clientes")
-        if not df2.empty:
-            df2.to_sql("clientes", conn, if_exists="append", index=False)
-        conn.commit()
-    finally:
-        conn.close()
+    """Substitui os clientes visíveis por este utilizador pelo conteúdo de df.
+    Um gestor só vê/apaga/insere os seus próprios clientes (RLS trata do âmbito);
+    o admin substitui a lista completa, tal como sempre funcionou."""
+    client = get_client()
+    df2 = clean_df(df).copy()
+
+    if not sou_admin:
+        # Um gestor só pode gravar clientes atribuídos a si mesmo — evita
+        # rejeições da RLS e garante que carteiras novas ficam bem atribuídas.
+        df2["Gestor_Email"] = meu_email_login
+        if not perfil_nome_vazio():
+            df2["Gestor_Nome"] = st.session_state.perfil["nome"]
+
+    client.table("clientes").delete().neq("nif", "").execute()
+    if not df2.empty:
+        registos = df2.rename(columns=COLUMN_MAP_TO_DB).to_dict("records")
+        client.table("clientes").upsert(registos, on_conflict="nif").execute()
+
+
+def perfil_nome_vazio() -> bool:
+    return not (st.session_state.perfil.get("nome") or "").strip()
 
 
 def persistir_clientes(df: pd.DataFrame):
-    """Atualiza a sessão E grava imediatamente na base de dados."""
+    """Atualiza a sessão E grava imediatamente no Supabase."""
     df = clean_df(df)
+    if not sou_admin:
+        df["Gestor_Email"] = meu_email_login
+        if not perfil_nome_vazio():
+            df["Gestor_Nome"] = st.session_state.perfil["nome"]
     st.session_state.clientes = df
     guardar_clientes_db(df)
 
 
 def carregar_log_db() -> list:
-    conn = get_conn()
-    try:
-        df = pd.read_sql_query("SELECT data, nif, nome, pagamento, estado FROM log_envios ORDER BY id", conn)
-    finally:
-        conn.close()
-    return df.to_dict("records")
+    client = get_client()
+    resp = client.table("log_envios").select("data, nif, nome, pagamento, estado").order("id").execute()
+    return resp.data or []
 
 
 def guardar_log_entry_db(entry: dict):
-    conn = get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO log_envios (data, nif, nome, pagamento, estado) VALUES (?,?,?,?,?)",
-            (entry["data"], entry["nif"], entry["nome"], entry["pagamento"], entry["estado"]),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    client = get_client()
+    client.table("log_envios").insert(entry).execute()
 
 
 def registar_log(entry: dict):
@@ -255,11 +261,46 @@ def registar_log(entry: dict):
     guardar_log_entry_db(entry)
 
 
+def carregar_config_db():
+    client = get_client()
+    resp = client.table("config").select("params_json, templates_json").eq("id", 1).execute()
+    if not resp.data:
+        return None, None
+    row = resp.data[0]
+    params_json, templates_json = row.get("params_json"), row.get("templates_json")
+    params, templates = None, None
+    if params_json:
+        params = {
+            "limiar_volume": params_json["limiar_volume"], "taxa_baixa": params_json["taxa_baixa"],
+            "taxa_alta": params_json["taxa_alta"], "limite_dispensa": params_json["limite_dispensa"],
+            "data1": date.fromisoformat(params_json["data1"]), "data2": date.fromisoformat(params_json["data2"]),
+            "data3": date.fromisoformat(params_json["data3"]),
+        }
+    if templates_json:
+        templates = {int(k): v for k, v in templates_json.items()}
+    return params, templates
+
+
+def guardar_config_db(params: dict, templates: dict):
+    """Só o admin tem permissão (RLS) para escrever a configuração global."""
+    if not sou_admin:
+        return
+    params_serializ = dict(params)
+    for k in ("data1", "data2", "data3"):
+        params_serializ[k] = params[k].isoformat()
+    templates_serializ = {str(k): v for k, v in templates.items()}
+    client = get_client()
+    client.table("config").upsert(
+        {"id": 1, "params_json": params_serializ, "templates_json": templates_serializ}
+    ).execute()
+
+
 # ---------------------------------------------------------------------------
 # Estado
 # ---------------------------------------------------------------------------
 def init_state():
-    init_db()
+    if "perfil" not in st.session_state:
+        carregar_perfil()
     if "clientes" not in st.session_state:
         st.session_state.clientes = carregar_clientes_db()
     if "guias" not in st.session_state:
@@ -292,7 +333,7 @@ def parse_numero_pt(serie: pd.Series) -> pd.Series:
             return None
         s = s.replace(" ", "").replace("€", "")
         if "," in s and "." in s:
-            # ex: "1.234,56" -> milhares '.', decimal ',' 
+            # ex: "1.234,56" -> milhares '.', decimal ','
             s = s.replace(".", "").replace(",", ".")
         elif "," in s:
             # ex: "4870,84" -> decimal ','
@@ -519,6 +560,7 @@ def extrair_nif_de_filename(filename: str):
 # UI
 # ---------------------------------------------------------------------------
 init_state()
+sidebar_utilizador()
 
 st.title("💶 Gestão de Pagamentos por Conta 2026")
 st.caption("SERVE — Contabilidade e Viabilização Empresarial")
@@ -526,24 +568,39 @@ st.caption("SERVE — Contabilidade e Viabilização Empresarial")
 with st.sidebar:
     st.header("Parâmetros de Cálculo")
     p = st.session_state.params
-    p["limiar_volume"] = st.number_input("Limiar Volume de Negócios (€)", value=float(p["limiar_volume"]), step=10000.0)
-    p["taxa_baixa"] = st.number_input("Taxa se Volume ≤ limiar", value=float(p["taxa_baixa"]), step=0.01, format="%.2f")
-    p["taxa_alta"] = st.number_input("Taxa se Volume > limiar", value=float(p["taxa_alta"]), step=0.01, format="%.2f")
-    p["limite_dispensa"] = st.number_input("Limite de dispensa (€)", value=float(p["limite_dispensa"]), step=10.0)
-    st.divider()
-    p["data1"] = st.date_input("Data limite 1.º Pagamento", value=p["data1"])
-    p["data2"] = st.date_input("Data limite 2.º Pagamento", value=p["data2"])
-    p["data3"] = st.date_input("Data limite 3.º Pagamento", value=p["data3"])
+    if sou_admin:
+        p["limiar_volume"] = st.number_input("Limiar Volume de Negócios (€)", value=float(p["limiar_volume"]), step=10000.0)
+        p["taxa_baixa"] = st.number_input("Taxa se Volume ≤ limiar", value=float(p["taxa_baixa"]), step=0.01, format="%.2f")
+        p["taxa_alta"] = st.number_input("Taxa se Volume > limiar", value=float(p["taxa_alta"]), step=0.01, format="%.2f")
+        p["limite_dispensa"] = st.number_input("Limite de dispensa (€)", value=float(p["limite_dispensa"]), step=10.0)
+        st.divider()
+        p["data1"] = st.date_input("Data limite 1.º Pagamento", value=p["data1"])
+        p["data2"] = st.date_input("Data limite 2.º Pagamento", value=p["data2"])
+        p["data3"] = st.date_input("Data limite 3.º Pagamento", value=p["data3"])
+    else:
+        st.caption("Estes parâmetros são definidos pelo administrador e aplicam-se a todos os clientes.")
+        st.write(f"Limiar Volume de Negócios: **{p['limiar_volume']:,.2f} €**")
+        st.write(f"Taxa ≤ limiar / > limiar: **{p['taxa_baixa']:.0%} / {p['taxa_alta']:.0%}**")
+        st.write(f"Limite de dispensa: **{p['limite_dispensa']:,.2f} €**")
+        st.divider()
+        st.write(f"Data limite 1.º Pagamento: **{p['data1'].strftime('%d/%m/%Y')}**")
+        st.write(f"Data limite 2.º Pagamento: **{p['data2'].strftime('%d/%m/%Y')}**")
+        st.write(f"Data limite 3.º Pagamento: **{p['data3'].strftime('%d/%m/%Y')}**")
     st.divider()
     st.caption("Fórmula: Total PPC = (Coleta IRC − Retenções) × Taxa, repartido em 3 prestações iguais, cada uma arredondada por excesso para euro (art. 105.º CIRC). Dispensa se (Coleta − Retenções) < limite definido.")
 
-tab_dash, tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📊 Dashboard", "📋 Clientes", "🧮 Cálculo PPC", "📎 Guias", "✉️ Emails", "⬇️ Exportar"]
-)
+nomes_tabs = ["📊 Dashboard", "📋 Clientes", "🧮 Cálculo PPC", "📎 Guias", "✉️ Emails", "⬇️ Exportar"]
+if sou_admin:
+    nomes_tabs.append("👥 Gestores")
+tabs = st.tabs(nomes_tabs)
+tab_dash, tab1, tab2, tab3, tab4, tab5 = tabs[:6]
+tab_gestores = tabs[6] if sou_admin else None
 
 # --- TAB 1: Clientes ---------------------------------------------------
 with tab1:
     st.subheader("Importar / Editar Clientes")
+    if not sou_admin:
+        st.caption(f"Estás a ver apenas os clientes atribuídos a ti ({meu_email_login}).")
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -574,24 +631,34 @@ with tab1:
         st.download_button("📥 Template CSV", template_csv, file_name="template_clientes.csv", mime="text/csv")
 
     st.markdown("**Tabela de clientes** — pode editar diretamente, adicionar ou apagar linhas.")
-    st.caption("O 'Gestor' é opcional — se preenchido, o email desse gestor entra automaticamente em CC quando enviares os avisos de pagamento a este cliente.")
+    if sou_admin:
+        st.caption("O 'Gestor' é opcional — se preenchido, o email desse gestor entra automaticamente em CC quando enviares os avisos de pagamento a este cliente, e esse gestor passa a ver este cliente na sua área.")
+    else:
+        st.caption("Os novos clientes que adicionares aqui ficam automaticamente atribuídos a ti.")
+    col_config = {
+        "Volume_2025": st.column_config.NumberColumn("Volume Negócios 2025 (campo 411)", format="%.2f"),
+        "Coleta_2025": st.column_config.NumberColumn("Coleta IRC 2025 (campo 351)", format="%.2f"),
+        "Retencoes_2025": st.column_config.NumberColumn("Retenções 2025 (campo 359)", format="%.2f"),
+        "Guia1_Emitida": st.column_config.CheckboxColumn("Guia 1 Emitida"),
+        "Guia2_Emitida": st.column_config.CheckboxColumn("Guia 2 Emitida"),
+        "Guia3_Emitida": st.column_config.CheckboxColumn("Guia 3 Emitida"),
+        "Email1_Enviado": st.column_config.CheckboxColumn("Email 1 Enviado"),
+        "Email2_Enviado": st.column_config.CheckboxColumn("Email 2 Enviado"),
+        "Email3_Enviado": st.column_config.CheckboxColumn("Email 3 Enviado"),
+    }
+    if sou_admin:
+        col_config["Gestor_Nome"] = st.column_config.TextColumn("Gestor (nome)")
+        col_config["Gestor_Email"] = st.column_config.TextColumn("Gestor (email, vai em CC)")
+    else:
+        # Um gestor não edita a atribuição de gestor (é sempre ele próprio) — mostra só como referência.
+        col_config["Gestor_Nome"] = st.column_config.TextColumn("Gestor (nome)", disabled=True)
+        col_config["Gestor_Email"] = st.column_config.TextColumn("Gestor (email)", disabled=True)
+
     edited = st.data_editor(
         st.session_state.clientes,
         num_rows="dynamic",
         use_container_width=True,
-        column_config={
-            "Gestor_Nome": st.column_config.TextColumn("Gestor (nome)"),
-            "Gestor_Email": st.column_config.TextColumn("Gestor (email, vai em CC)"),
-            "Volume_2025": st.column_config.NumberColumn("Volume Negócios 2025 (campo 411)", format="%.2f"),
-            "Coleta_2025": st.column_config.NumberColumn("Coleta IRC 2025 (campo 351)", format="%.2f"),
-            "Retencoes_2025": st.column_config.NumberColumn("Retenções 2025 (campo 359)", format="%.2f"),
-            "Guia1_Emitida": st.column_config.CheckboxColumn("Guia 1 Emitida"),
-            "Guia2_Emitida": st.column_config.CheckboxColumn("Guia 2 Emitida"),
-            "Guia3_Emitida": st.column_config.CheckboxColumn("Guia 3 Emitida"),
-            "Email1_Enviado": st.column_config.CheckboxColumn("Email 1 Enviado"),
-            "Email2_Enviado": st.column_config.CheckboxColumn("Email 2 Enviado"),
-            "Email3_Enviado": st.column_config.CheckboxColumn("Email 3 Enviado"),
-        },
+        column_config=col_config,
         key="editor_clientes",
     )
     if st.button("💾 Guardar alterações à tabela"):
@@ -643,7 +710,7 @@ with tab_dash:
         else:
             st.dataframe(pendentes_df, use_container_width=True, height=300, hide_index=True)
 
-        st.caption("💾 Os dados dos clientes ficam guardados de forma persistente (base de dados local) — não se perdem ao fechar o browser, exportar, ou voltar mais tarde para tratar do 2.º ou 3.º pagamento. As guias em PDF carregadas na aba 'Guias', porém, só existem durante a sessão atual — o estado 'Guia Emitida' fica guardado, mas o ficheiro em si tens de recarregar se voltares noutro dia.")
+        st.caption("💾 Os dados dos clientes ficam guardados de forma persistente no Supabase — não se perdem ao fechar o browser, exportar, ou voltar mais tarde para tratar do 2.º ou 3.º pagamento. As guias em PDF carregadas na aba 'Guias', porém, só existem durante a sessão atual — o estado 'Guia Emitida' fica guardado, mas o ficheiro em si tens de recarregar se voltares noutro dia.")
 
 # --- TAB 2: Cálculo ------------------------------------------------------
 with tab2:
@@ -753,9 +820,14 @@ with tab4:
         tpl = st.session_state.templates[n_pag_email]
 
         with st.expander("✏️ Editar template deste email"):
-            tpl["assunto"] = st.text_input("Assunto", value=tpl["assunto"], key=f"assunto_{n_pag_email}")
-            tpl["corpo"] = st.text_area("Corpo", value=tpl["corpo"], height=300, key=f"corpo_{n_pag_email}")
-            st.caption("Placeholders disponíveis: {nome} {nif} {email} {pag1} {pag2} {pag3} {total} {data1} {data2} {data3}")
+            if sou_admin:
+                tpl["assunto"] = st.text_input("Assunto", value=tpl["assunto"], key=f"assunto_{n_pag_email}")
+                tpl["corpo"] = st.text_area("Corpo", value=tpl["corpo"], height=300, key=f"corpo_{n_pag_email}")
+                st.caption("Placeholders disponíveis: {nome} {nif} {email} {pag1} {pag2} {pag3} {total} {data1} {data2} {data3}")
+            else:
+                st.caption("Os templates de email são definidos pelo administrador.")
+                st.text_input("Assunto", value=tpl["assunto"], disabled=True)
+                st.text_area("Corpo", value=tpl["corpo"], height=300, disabled=True)
 
         elegiveis = df_calc[~df_calc["Dispensado"]].copy()
         elegiveis = elegiveis[elegiveis["Email"].str.strip() != ""]
@@ -891,7 +963,65 @@ with tab5:
             log_csv = pd.DataFrame(st.session_state.log_envio).to_csv(index=False, sep=";")
             st.download_button("⬇️ Descarregar log de envios (CSV)", log_csv, file_name="log_envios_ppc.csv", mime="text/csv")
 
+# --- TAB GESTORES (só admin) ------------------------------------------------
+if sou_admin and tab_gestores is not None:
+    with tab_gestores:
+        st.subheader("Contas de Gestor")
+        st.caption("Cria e gere as contas de login dos gestores da SERVE. Depois de criares a conta, atribui os clientes a este gestor na aba 'Clientes' (campo Gestor_Email igual ao email de login abaixo).")
+
+        client = get_client()
+        perfis_resp = client.table("perfis").select("*").order("email").execute()
+        perfis_lista = perfis_resp.data or []
+
+        if perfis_lista:
+            st.dataframe(
+                pd.DataFrame(perfis_lista)[["email", "nome", "role"]].rename(
+                    columns={"email": "Email", "nome": "Nome", "role": "Papel"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Ainda não há contas registadas além da tua.")
+
+        st.divider()
+        st.markdown("### Criar nova conta de gestor")
+
+        if not SUPABASE_SERVICE_KEY:
+            st.warning(
+                "Falta configurar SUPABASE_SERVICE_KEY em Settings → Secrets para poderes criar contas "
+                "diretamente pela app. Ver GUIA_SUPABASE.md, secção 'Adicionar gestores'."
+            )
+        else:
+            with st.form("form_novo_gestor"):
+                novo_nome = st.text_input("Nome do gestor")
+                novo_email = st.text_input("Email de login")
+                nova_pass = st.text_input("Password inicial (o gestor pode alterá-la depois)", type="password")
+                novo_role = st.selectbox("Papel", ["gestor", "admin"])
+                submitted = st.form_submit_button("Criar conta")
+                if submitted:
+                    if not novo_email or not nova_pass:
+                        st.error("Preenche pelo menos o email e a password.")
+                    else:
+                        try:
+                            admin_client = get_admin_client()
+                            criado = admin_client.auth.admin.create_user(
+                                {
+                                    "email": novo_email,
+                                    "password": nova_pass,
+                                    "email_confirm": True,
+                                    "user_metadata": {"nome": novo_nome},
+                                }
+                            )
+                            admin_client.table("perfis").upsert(
+                                {"id": criado.user.id, "email": novo_email, "nome": novo_nome, "role": novo_role}
+                            ).execute()
+                            st.success(f"Conta criada para {novo_email}. Já pode entrar na app com esta password.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Não foi possível criar a conta: {e}")
+
 # ---------------------------------------------------------------------------
-# Persistir parâmetros e templates (captura o estado final de todos os widgets desta execução)
+# Persistir parâmetros e templates (só o admin escreve; RLS bloqueia o resto)
 # ---------------------------------------------------------------------------
 guardar_config_db(st.session_state.params, st.session_state.templates)
