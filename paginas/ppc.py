@@ -15,10 +15,12 @@ from common import (
     enviar_email,
     extrair_nif_de_filename,
     gerar_excel_ppc,
+    guardar_config_db,
     montar_base_ppc,
     persistir_ppc,
     registar_log,
     render_template,
+    smtp_config_form,
     sou_admin,
 )
 
@@ -261,18 +263,7 @@ with tab_emails:
             st.write("📎 Guia anexada:", "✅ Sim" if tem_guia else "❌ Não carregada (aba Guias)")
 
         st.divider()
-        st.markdown("### Configuração SMTP")
-        c1, c2 = st.columns(2)
-        with c1:
-            smtp_host = st.text_input("Servidor SMTP", value="smtp.office365.com")
-            smtp_user = st.text_input("Utilizador (email de login)")
-            smtp_from = st.text_input("Remetente (From)", value=smtp_user)
-        with c2:
-            smtp_port = st.number_input("Porta", value=587, step=1)
-            smtp_tls = st.checkbox("Usar STARTTLS (recomendado, porta 587)", value=True)
-            smtp_pass = st.text_input("Password / App Password", type="password")
-
-        st.caption("Gmail: smtp.gmail.com, porta 587, TLS — requer 'App Password'. Office365/Outlook: smtp.office365.com, porta 587, TLS. A password nunca é guardada — só usada durante o envio nesta sessão.")
+        smtp_cfg = smtp_config_form()
 
         com_guia = [n for n in elegiveis["NIF"].tolist() if (n, n_pag_email) in st.session_state.guias]
         sem_guia = [n for n in elegiveis["NIF"].tolist() if n not in com_guia]
@@ -312,13 +303,9 @@ with tab_emails:
         )
 
         if st.button("🚀 Enviar Emails Selecionados", type="primary", disabled=not selecionados):
-            if not smtp_user or not smtp_pass:
+            if not smtp_cfg["utilizador"] or not smtp_cfg["password"]:
                 st.error("Preencher utilizador e password SMTP.")
             else:
-                smtp_cfg = {
-                    "host": smtp_host, "porta": int(smtp_port), "tls": smtp_tls,
-                    "utilizador": smtp_user, "password": smtp_pass, "remetente": smtp_from,
-                }
                 progress = st.progress(0.0)
                 status_box = st.empty()
                 df_full = montar_base_ppc()
@@ -375,3 +362,6 @@ with tab_export:
         if st.session_state.log_envio:
             log_csv = pd.DataFrame(st.session_state.log_envio).to_csv(index=False, sep=";")
             st.download_button("⬇️ Descarregar log de envios (CSV)", log_csv, file_name="log_envios_ppc.csv", mime="text/csv")
+
+# Persistir os parâmetros/templates do PPC caso o admin os tenha editado nesta execução (RLS bloqueia gestores).
+guardar_config_db(st.session_state.params, st.session_state.templates, st.session_state.get("template_irs"))
