@@ -266,7 +266,8 @@ def guardar_clientes_db(df: pd.DataFrame):
 
 
 def persistir_clientes(df: pd.DataFrame):
-    """Atualiza a sessão E grava imediatamente no Supabase."""
+    """Atualiza a sessão E grava imediatamente no Supabase. Usa-se quando 'df' é
+    o conjunto COMPLETO de clientes pretendido (ex: importação) — substitui tudo."""
     df = clean_clientes_df(df)
     if not sou_admin():
         df["Gestor_Email"] = meu_email()
@@ -274,6 +275,37 @@ def persistir_clientes(df: pd.DataFrame):
             df["Gestor_Nome"] = st.session_state.perfil["nome"]
     st.session_state.clientes = df
     guardar_clientes_db(df)
+
+
+def guardar_clientes_parcial_db(df_editado: pd.DataFrame, nifs_visiveis_antes: set) -> pd.DataFrame:
+    """Grava só as alterações dentro de um subconjunto filtrado (ex: 'Só IRS'),
+    sem tocar em clientes fora desse filtro. Compara os NIFs que estavam
+    visíveis antes da edição com os que sobram depois — os que desapareceram
+    do filtro são apagados, os restantes são upsert. Devolve o df já limpo."""
+    client = get_client()
+    df2 = clean_clientes_df(df_editado).copy()
+    if not sou_admin():
+        df2["Gestor_Email"] = meu_email()
+        if not perfil_nome_vazio():
+            df2["Gestor_Nome"] = st.session_state.perfil["nome"]
+
+    nifs_finais = set(df2["NIF"])
+    nifs_para_apagar = nifs_visiveis_antes - nifs_finais
+    if nifs_para_apagar:
+        client.table("clientes").delete().in_("nif", list(nifs_para_apagar)).execute()
+    if not df2.empty:
+        registos = df2.rename(columns=COLUMN_MAP_TO_DB).to_dict("records")
+        client.table("clientes").upsert(registos, on_conflict="nif").execute()
+    return df2
+
+
+def persistir_clientes_parcial(df_editado: pd.DataFrame, nifs_visiveis_antes: set):
+    """Versão segura para usar com uma tabela FILTRADA (ex: só clientes de IRS):
+    só toca nas linhas que estavam visíveis nesse filtro, nunca nas restantes."""
+    df2 = guardar_clientes_parcial_db(df_editado, nifs_visiveis_antes)
+    completo = clean_clientes_df(st.session_state.clientes)
+    resto = completo[~completo["NIF"].isin(nifs_visiveis_antes)]
+    st.session_state.clientes = clean_clientes_df(pd.concat([resto, df2], ignore_index=True))
 
 
 # ---------------------------------------------------------------------------
