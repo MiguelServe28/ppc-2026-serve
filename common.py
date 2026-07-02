@@ -771,27 +771,53 @@ def _extrair_texto_pdf(ficheiro_bytes: bytes) -> str:
     return "\n".join(texto_paginas)
 
 
-def extrair_dados_liquidacao_irs(ficheiro_bytes: bytes) -> dict:
+def extrair_dados_liquidacao_irs(ficheiro_bytes: bytes, nif_esperado: str = None) -> dict:
     """Lê uma 'Demonstração de Liquidação de IRS' da Autoridade Tributária e tenta
-    extrair o NIF (Sujeito Passivo), o número de liquidação e o valor apurado final.
-    Devolve sempre um dicionário com as chaves — valores a None se não encontrar,
-    para a página poder avisar e pedir preenchimento manual em vez de adivinhar."""
-    resultado = {"nif": None, "numero_liquidacao": None, "periodo": None, "valor_apurado": None, "texto_bruto": ""}
+    extrair o número de liquidação e o valor final (a pagar, a receber, ou
+    apurado quando é zero). Se 'nif_esperado' for indicado, verifica apenas se
+    esse NIF aparece em algum lado do documento — não tenta identificar/listar
+    todos os NIFs do documento (podem ser um ou dois, em declarações conjuntas,
+    e não interessa a posição, só se o do cliente lá está). Devolve sempre um
+    dicionário com as chaves — valores a None se não encontrar, para a página
+    poder avisar e pedir preenchimento manual em vez de adivinhar."""
+    resultado = {
+        "nif_confirmado": None, "numero_liquidacao": None, "periodo": None,
+        "valor_apurado": None, "tipo_valor": None, "texto_bruto": "",
+    }
     try:
         texto = _extrair_texto_pdf(ficheiro_bytes)
     except Exception:
         return resultado
     resultado["texto_bruto"] = texto
 
-    m_linha = re.search(r"(\d{9})\s+(\d{4}\.\d+)\s+(\d{4}-\d{2}-\d{2})\s+a\s+(\d{4}-\d{2}-\d{2})", texto)
-    if m_linha:
-        resultado["nif"] = m_linha.group(1)
-        resultado["numero_liquidacao"] = m_linha.group(2)
-        resultado["periodo"] = f"{m_linha.group(3)} a {m_linha.group(4)}"
+    if nif_esperado:
+        resultado["nif_confirmado"] = bool(re.search(rf"\b{re.escape(nif_esperado)}\b", texto))
 
-    m_valor = re.search(r"Valor apurado\s+(-?[\d\.]+,\d{2})", texto)
+    # Número de liquidação (formato "AAAA.dígitos") seguido do período de
+    # rendimentos — não precisamos de capturar o(s) NIF(s) que vêm antes.
+    m_linha = re.search(
+        r"(?P<numero>\d{4}\.\d+)\s+(?P<periodo_ini>\d{4}-\d{2}-\d{2})\s+a\s+(?P<periodo_fim>\d{4}-\d{2}-\d{2})",
+        texto,
+    )
+    if m_linha:
+        resultado["numero_liquidacao"] = m_linha.group("numero")
+        resultado["periodo"] = f"{m_linha.group('periodo_ini')} a {m_linha.group('periodo_fim')}"
+
+    # O valor final vem sempre rotulado — "Valor a pagar", "Valor a receber" ou
+    # "Valor apurado" (quando não há nada a pagar nem a receber). O próprio
+    # rótulo diz-nos o sinal, por isso não precisamos de adivinhar a partir do
+    # número (o número no PDF vem sempre positivo, mesmo quando é um reembolso).
+    m_valor = re.search(r"Valor (a pagar|a receber|apurado)\s+(-?[\d\.]+,\d{2})", texto)
     if m_valor:
-        resultado["valor_apurado"] = _parse_valor_pt(m_valor.group(1))
+        rotulo = m_valor.group(1)
+        numero = _parse_valor_pt(m_valor.group(2))
+        if numero is not None:
+            if rotulo == "a receber":
+                numero = -abs(numero)
+            elif rotulo == "a pagar":
+                numero = abs(numero)
+        resultado["valor_apurado"] = numero
+        resultado["tipo_valor"] = rotulo
 
     return resultado
 
