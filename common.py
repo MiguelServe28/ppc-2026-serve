@@ -18,6 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import pandas as pd
+import pdfplumber
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -338,12 +339,13 @@ def registar_log(entry: dict):
 
 def carregar_config_db():
     client = get_client()
-    resp = client.table("config").select("params_json, templates_json").eq("id", 1).execute()
+    resp = client.table("config").select("params_json, templates_json, templates_irs_json").eq("id", 1).execute()
     if not resp.data:
-        return None, None
+        return None, None, None
     row = resp.data[0]
     params_json, templates_json = row.get("params_json"), row.get("templates_json")
-    params, templates = None, None
+    templates_irs_json = row.get("templates_irs_json")
+    params, templates, template_irs = None, None, None
     if params_json:
         params = {
             "limiar_volume": params_json["limiar_volume"], "taxa_baixa": params_json["taxa_baixa"],
@@ -353,10 +355,12 @@ def carregar_config_db():
         }
     if templates_json:
         templates = {int(k): v for k, v in templates_json.items()}
-    return params, templates
+    if templates_irs_json:
+        template_irs = templates_irs_json
+    return params, templates, template_irs
 
 
-def guardar_config_db(params: dict, templates: dict):
+def guardar_config_db(params: dict, templates: dict, template_irs: dict = None):
     """Só o admin tem permissão (RLS) para escrever a configuração global."""
     if not sou_admin():
         return
@@ -364,10 +368,11 @@ def guardar_config_db(params: dict, templates: dict):
     for k in ("data1", "data2", "data3"):
         params_serializ[k] = params[k].isoformat()
     templates_serializ = {str(k): v for k, v in templates.items()}
+    registo = {"id": 1, "params_json": params_serializ, "templates_json": templates_serializ}
+    if template_irs is not None:
+        registo["templates_irs_json"] = template_irs
     client = get_client()
-    client.table("config").upsert(
-        {"id": 1, "params_json": params_serializ, "templates_json": templates_serializ}
-    ).execute()
+    client.table("config").upsert(registo).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -380,10 +385,16 @@ def init_state():
         st.session_state.clientes = carregar_clientes_db()
     if "ppc_dados" not in st.session_state:
         st.session_state.ppc_dados = carregar_ppc_db()
+    if "irs_dados" not in st.session_state:
+        st.session_state.irs_dados = carregar_irs_db()
     if "guias" not in st.session_state:
         st.session_state.guias = {}  # {(nif, n_pagamento): (filename, bytes)} — só dura a sessão atual
-    if "params" not in st.session_state or "templates" not in st.session_state:
-        params_db, templates_db = carregar_config_db()
+    if "guias_irs" not in st.session_state:
+        st.session_state.guias_irs = {}  # {nif: (filename, bytes)} — guia de pagamento de IRS, só dura a sessão
+    if "faturas_irs" not in st.session_state:
+        st.session_state.faturas_irs = {}  # {nif: (filename, bytes)} — fatura do serviço de IRS, só dura a sessão
+    if "params" not in st.session_state or "templates" not in st.session_state or "template_irs" not in st.session_state:
+        params_db, templates_db, template_irs_db = carregar_config_db()
         if "params" not in st.session_state:
             st.session_state.params = params_db or {
                 "limiar_volume": 500000.0,
@@ -396,6 +407,8 @@ def init_state():
             }
         if "templates" not in st.session_state:
             st.session_state.templates = templates_db or {k: v.copy() for k, v in DEFAULT_TEMPLATES.items()}
+        if "template_irs" not in st.session_state:
+            st.session_state.template_irs = template_irs_db or DEFAULT_TEMPLATE_IRS.copy()
     if "log_envio" not in st.session_state:
         st.session_state.log_envio = carregar_log_db()
 
@@ -617,3 +630,221 @@ def enviar_email(smtp_cfg, destinatario, assunto, corpo, anexos, cc=None):
 def extrair_nif_de_filename(filename: str):
     m = re.search(r"\b(\d{9})\b", filename)
     return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Configuração SMTP partilhada (evita ter de reintroduzir as credenciais em
+# cada página que envia email, dentro da mesma sessão)
+# ---------------------------------------------------------------------------
+def smtp_config_form() -> dict:
+    if "smtp_cfg" not in st.session_state:
+        st.session_state.smtp_cfg = {
+            "host": "smtp.office365.com", "porta": 587, "tls": True,
+            "utilizador": "", "password": "", "remetente": "",
+        }
+    cfg = st.session_state.smtp_cfg
+    st.markdown("### Configuração SMTP")
+    c1, c2 = st.columns(2)
+    with c1:
+        cfg["host"] = st.text_input("Servidor SMTP", value=cfg["host"], key="smtp_host")
+        cfg["utilizador"] = st.text_input("Utilizador (email de login)", value=cfg["utilizador"], key="smtp_user")
+        cfg["remetente"] = st.text_input("Remetente (From)", value=cfg["utilizador"] or cfg["remetente"], key="smtp_from")
+    with c2:
+        cfg["porta"] = st.number_input("Porta", value=int(cfg["porta"]), step=1, key="smtp_port")
+        cfg["tls"] = st.checkbox("Usar STARTTLS (recomendado, porta 587)", value=cfg["tls"], key="smtp_tls")
+        cfg["password"] = st.text_input("Password / App Password", value=cfg["password"], type="password", key="smtp_pass")
+    st.caption("Gmail: smtp.gmail.com, porta 587, TLS — requer 'App Password'. Office365/Outlook: smtp.office365.com, porta 587, TLS. A password não é guardada na base de dados — fica só nesta sessão do browser.")
+    return {"host": cfg["host"], "porta": int(cfg["porta"]), "tls": cfg["tls"],
+            "utilizador": cfg["utilizador"], "password": cfg["password"], "remetente": cfg["remetente"]}
+
+
+# ---------------------------------------------------------------------------
+# IRS — dados específicos (tabela própria, ligada por NIF) e leitura de PDFs
+# ---------------------------------------------------------------------------
+IRS_COLS = ["NIF", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado"]
+IRS_NUM_COLS = ["Valor_Apurado", "Valor_Pendente"]
+IRS_BOOL_COLS = ["Incluido_Avenca", "Email_Enviado"]
+
+IRS_COLUMN_MAP_TO_DB = {
+    "NIF": "nif", "Numero_Liquidacao": "numero_liquidacao",
+    "Valor_Apurado": "valor_apurado", "Valor_Pendente": "valor_pendente",
+    "Incluido_Avenca": "incluido_avenca", "Email_Enviado": "email_enviado",
+}
+IRS_COLUMN_MAP_FROM_DB = {v: k for k, v in IRS_COLUMN_MAP_TO_DB.items()}
+
+DEFAULT_TEMPLATE_IRS = {
+    "assunto": "Liquidação de IRS — {nome}",
+    "corpo": (
+        "Exmo(a). Sr(a).,\n\n"
+        "Junto enviamos a Demonstração de Liquidação de IRS referente ao ano de 2025 "
+        "(NIF {nif}{ref_liquidacao}).\n\n"
+        "{frase_valor}\n\n"
+        "{frase_pendente}"
+        "Segue também em anexo a guia de pagamento, quando aplicável.\n\n"
+        "Ficamos ao dispor para qualquer esclarecimento.\n\n"
+        "Com os melhores cumprimentos,"
+    ),
+}
+
+
+def clean_irs_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in IRS_COLS:
+        if c not in df.columns:
+            if c in IRS_BOOL_COLS:
+                df[c] = False
+            elif c in IRS_NUM_COLS:
+                df[c] = 0.0
+            else:
+                df[c] = ""
+    df["NIF"] = df["NIF"].fillna("").astype(str).str.strip()
+    df["Numero_Liquidacao"] = df["Numero_Liquidacao"].fillna("").astype(str).str.strip()
+    for c in IRS_NUM_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in IRS_BOOL_COLS:
+        df[c] = df[c].fillna(False).astype(bool)
+    df = df[df["NIF"] != ""]
+    return df[IRS_COLS]
+
+
+def carregar_irs_db() -> pd.DataFrame:
+    client = get_client()
+    resp = client.table("irs_dados").select("*").execute()
+    rows = resp.data or []
+    if not rows:
+        return pd.DataFrame(columns=IRS_COLS)
+    df = pd.DataFrame(rows).rename(columns=IRS_COLUMN_MAP_FROM_DB)
+    return clean_irs_df(df)
+
+
+def guardar_irs_db(df: pd.DataFrame):
+    client = get_client()
+    df2 = clean_irs_df(df).copy()
+    client.table("irs_dados").delete().neq("nif", "").execute()
+    if not df2.empty:
+        registos = df2.rename(columns=IRS_COLUMN_MAP_TO_DB).to_dict("records")
+        client.table("irs_dados").upsert(registos, on_conflict="nif").execute()
+
+
+def persistir_irs(df: pd.DataFrame):
+    df = clean_irs_df(df)
+    st.session_state.irs_dados = df
+    guardar_irs_db(df)
+
+
+def montar_base_irs() -> pd.DataFrame:
+    """Junta os clientes com 'Aplica_IRS' ligado com os respetivos dados de IRS
+    (mesmo que ainda não tenham nenhum valor preenchido)."""
+    clientes = clean_clientes_df(st.session_state.clientes)
+    elegiveis = clientes[clientes["Aplica_IRS"]].copy()
+    irs = clean_irs_df(st.session_state.get("irs_dados", pd.DataFrame(columns=IRS_COLS)))
+    base = elegiveis.merge(irs, on="NIF", how="left")
+    for c in IRS_NUM_COLS:
+        base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0.0)
+    for c in IRS_BOOL_COLS:
+        base[c] = base[c].fillna(False).astype(bool)
+    base["Numero_Liquidacao"] = base["Numero_Liquidacao"].fillna("")
+    return base
+
+
+def _parse_valor_pt(texto: str):
+    """Converte um número em formato português (ex: '-1.234,56') encontrado em
+    texto extraído de PDF para float. Devolve None se não conseguir converter."""
+    if texto is None:
+        return None
+    s = texto.strip().replace(" ", "").replace("€", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _extrair_texto_pdf(ficheiro_bytes: bytes) -> str:
+    texto_paginas = []
+    with pdfplumber.open(io.BytesIO(ficheiro_bytes)) as pdf:
+        for pagina in pdf.pages:
+            texto_paginas.append(pagina.extract_text() or "")
+    return "\n".join(texto_paginas)
+
+
+def extrair_dados_liquidacao_irs(ficheiro_bytes: bytes) -> dict:
+    """Lê uma 'Demonstração de Liquidação de IRS' da Autoridade Tributária e tenta
+    extrair o NIF (Sujeito Passivo), o número de liquidação e o valor apurado final.
+    Devolve sempre um dicionário com as chaves — valores a None se não encontrar,
+    para a página poder avisar e pedir preenchimento manual em vez de adivinhar."""
+    resultado = {"nif": None, "numero_liquidacao": None, "periodo": None, "valor_apurado": None, "texto_bruto": ""}
+    try:
+        texto = _extrair_texto_pdf(ficheiro_bytes)
+    except Exception:
+        return resultado
+    resultado["texto_bruto"] = texto
+
+    m_linha = re.search(r"(\d{9})\s+(\d{4}\.\d+)\s+(\d{4}-\d{2}-\d{2})\s+a\s+(\d{4}-\d{2}-\d{2})", texto)
+    if m_linha:
+        resultado["nif"] = m_linha.group(1)
+        resultado["numero_liquidacao"] = m_linha.group(2)
+        resultado["periodo"] = f"{m_linha.group(3)} a {m_linha.group(4)}"
+
+    m_valor = re.search(r"Valor apurado\s+(-?[\d\.]+,\d{2})", texto)
+    if m_valor:
+        resultado["valor_apurado"] = _parse_valor_pt(m_valor.group(1))
+
+    return resultado
+
+
+def extrair_dados_pendentes_irs(ficheiro_bytes: bytes) -> dict:
+    """Lê um 'Controlo de Pendentes' (extrato de faturas em dívida à SERVE, gerado
+    pelo TOConline) e tenta extrair o NIF do cliente e o total pendente."""
+    resultado = {"nif": None, "valor_pendente": None, "texto_bruto": ""}
+    try:
+        texto = _extrair_texto_pdf(ficheiro_bytes)
+    except Exception:
+        return resultado
+    resultado["texto_bruto"] = texto
+
+    m_nif = re.search(r"EUR\s+(\d{9})", texto)
+    if m_nif:
+        resultado["nif"] = m_nif.group(1)
+
+    m_total = re.search(r"TOTAL PENDENTE\s+([\d\.,]+)", texto)
+    if m_total:
+        resultado["valor_pendente"] = _parse_valor_pt(m_total.group(1))
+
+    return resultado
+
+
+def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
+    valor = row.get("Valor_Apurado", 0.0) or 0.0
+    if valor > 0:
+        frase_valor = f"Do apuramento efetuado, resulta um valor a pagar de {formatar_valor(valor)} €."
+    elif valor < 0:
+        frase_valor = f"Do apuramento efetuado, resulta um valor a receber (reembolso) de {formatar_valor(abs(valor))} €."
+    else:
+        frase_valor = "Do apuramento efetuado, não resulta qualquer valor a pagar ou a receber."
+
+    pendente = row.get("Valor_Pendente", 0.0) or 0.0
+    if pendente > 0:
+        frase_pendente = (
+            f"Informamos ainda que, de acordo com os nossos registos, tem pendente o valor de "
+            f"{formatar_valor(pendente)} € referente a honorários em dívida à SERVE.\n\n"
+        )
+    else:
+        frase_pendente = ""
+
+    ref_liquidacao = f", n.º de liquidação {row['Numero_Liquidacao']}" if row.get("Numero_Liquidacao") else ""
+
+    ctx = {
+        "nome": row["Nome"],
+        "nif": row["NIF"],
+        "email": row["Email"],
+        "ref_liquidacao": ref_liquidacao,
+        "frase_valor": frase_valor,
+        "frase_pendente": frase_pendente,
+    }
+    assunto = template["assunto"].format(**ctx)
+    corpo = template["corpo"].format(**ctx)
+    return assunto, corpo
