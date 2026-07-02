@@ -115,6 +115,18 @@ with tab_processar:
                 st.success(
                     f"Valor {rotulo_legivel}: {abs(dados_liq['valor_apurado']):,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
                 )
+            # Um widget com "key" só usa o "value=" passado na primeira vez que é criado — depois disso,
+            # o Streamlit mantém o que já está gravado em session_state para essa key. Por isso, sempre que
+            # detetamos um ficheiro novo (nome+tamanho diferente do último processado para este cliente),
+            # atualizamos nós próprios o session_state antes dos campos serem criados mais abaixo.
+            ficheiro_id = f"{up_liq.name}_{up_liq.size}"
+            chave_rastreio = f"_liq_processado_{nif_escolhido}"
+            if st.session_state.get(chave_rastreio) != ficheiro_id:
+                st.session_state[chave_rastreio] = ficheiro_id
+                if dados_liq["valor_apurado"] is not None:
+                    st.session_state[f"valor_apurado_{nif_escolhido}"] = dados_liq["valor_apurado"]
+                if dados_liq["numero_liquidacao"]:
+                    st.session_state[f"num_liq_{nif_escolhido}"] = dados_liq["numero_liquidacao"]
 
     with col_p:
         up_pend = st.file_uploader("Controlo de Pendentes (PDF, opcional)", type=["pdf"], key=f"up_pend_irs_{nif_escolhido}")
@@ -127,6 +139,12 @@ with tab_processar:
                 st.warning("Não consegui ler o total pendente automaticamente — preenche manualmente abaixo, se aplicável.")
             else:
                 st.success(f"Total pendente lido: {dados_pend['valor_pendente']:,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
+            ficheiro_id_pend = f"{up_pend.name}_{up_pend.size}"
+            chave_rastreio_pend = f"_pend_processado_{nif_escolhido}"
+            if st.session_state.get(chave_rastreio_pend) != ficheiro_id_pend:
+                st.session_state[chave_rastreio_pend] = ficheiro_id_pend
+                if dados_pend["valor_pendente"] is not None:
+                    st.session_state[f"valor_pendente_{nif_escolhido}"] = dados_pend["valor_pendente"]
 
     st.divider()
     st.markdown("### 2. Confirmar Valores (edita se necessário antes de gravar)")
@@ -136,7 +154,7 @@ with tab_processar:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        numero_liq_edit = st.text_input("Nº de Liquidação", value=numero_default, key=f"num_liq_{nif_escolhido}")
+        numero_liq_edit = st.text_input("Nº de Liquidação (opcional)", value=numero_default, key=f"num_liq_{nif_escolhido}")
     with c2:
         valor_edit = st.number_input(
             "Valor Apurado (€) — positivo = a pagar, negativo = a receber",
