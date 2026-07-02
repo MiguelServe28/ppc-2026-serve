@@ -16,6 +16,7 @@ from common import (
     ler_ficheiro_importacao,
     meu_email,
     persistir_clientes,
+    persistir_clientes_parcial,
     persistir_ppc,
     sou_admin,
 )
@@ -75,6 +76,36 @@ with col2:
     ).to_csv(index=False, sep=";")
     st.download_button("📥 Template CSV", template_csv, file_name="template_clientes.csv", mime="text/csv")
 
+st.divider()
+FILTROS_IMPOSTO = {
+    "Todos": None,
+    "Só PPC": "Aplica_PPC",
+    "Só IVA": "Aplica_IVA",
+    "Só IMI": "Aplica_IMI",
+    "Só IRS": "Aplica_IRS",
+    "Só Segurança Social": "Aplica_SS",
+    "Sem nenhum imposto atribuído": "__nenhum__",
+}
+filtro_escolhido = st.selectbox(
+    "Mostrar",
+    list(FILTROS_IMPOSTO.keys()),
+    key="filtro_clientes",
+    help="Filtra a tabela abaixo — útil para veres só os clientes de um imposto (ex: os que só têm IRS) sem os teres misturados visualmente com os restantes.",
+)
+todos_clientes = clean_clientes_df(st.session_state.clientes)
+coluna_filtro = FILTROS_IMPOSTO[filtro_escolhido]
+if coluna_filtro is None:
+    clientes_mostrados = todos_clientes
+elif coluna_filtro == "__nenhum__":
+    nenhum_aplica = ~(todos_clientes["Aplica_PPC"] | todos_clientes["Aplica_IVA"] | todos_clientes["Aplica_IMI"]
+                       | todos_clientes["Aplica_IRS"] | todos_clientes["Aplica_SS"])
+    clientes_mostrados = todos_clientes[nenhum_aplica]
+else:
+    clientes_mostrados = todos_clientes[todos_clientes[coluna_filtro]]
+
+nifs_visiveis_antes = set(clientes_mostrados["NIF"])
+st.caption(f"A mostrar {len(clientes_mostrados)} de {len(todos_clientes)} cliente(s) no total.")
+
 st.markdown("**Tabela de clientes** — pode editar diretamente, adicionar ou apagar linhas.")
 col_config = {
     "Tipo_Empresa": st.column_config.CheckboxColumn("Empresa"),
@@ -95,13 +126,18 @@ else:
     col_config["Gestor_Email"] = st.column_config.TextColumn("Gestor (email)", disabled=True)
 
 edited = st.data_editor(
-    st.session_state.clientes,
+    clientes_mostrados,
     num_rows="dynamic",
     use_container_width=True,
     column_config=col_config,
     key="editor_clientes",
 )
 if st.button("💾 Guardar alterações à tabela"):
-    persistir_clientes(edited)
+    edited_final = clean_clientes_df(edited)
+    if coluna_filtro not in (None, "__nenhum__"):
+        # Uma linha nova adicionada enquanto este filtro está ativo assume-se que é para este imposto.
+        novas = ~edited_final["NIF"].isin(nifs_visiveis_antes)
+        edited_final.loc[novas, coluna_filtro] = True
+    persistir_clientes_parcial(edited_final, nifs_visiveis_antes)
     st.success("Tabela atualizada e guardada — os dados ficam gravados mesmo depois de fechares o browser.")
     st.rerun()
