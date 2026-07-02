@@ -12,11 +12,14 @@ import streamlit as st
 
 from common import (
     IRS_COLS,
+    clean_clientes_df,
     enviar_email,
     extrair_dados_liquidacao_irs,
     extrair_dados_pendentes_irs,
     guardar_config_db,
+    ler_ficheiro_importacao,
     montar_base_irs,
+    persistir_clientes,
     persistir_irs,
     registar_log,
     render_template_irs,
@@ -34,11 +37,44 @@ st.caption(
 
 base_irs = montar_base_irs()
 
-if base_irs.empty:
-    st.info("Ainda não há clientes com 'Aplica IRS' ligado. Ativa esse interruptor na página 'Clientes'.")
-    st.stop()
+tab_importar, tab_visao, tab_processar, tab_template = st.tabs(
+    ["📥 Importar Clientes", "📊 Visão Geral", "📎 Processar Cliente", "✏️ Template de Email"]
+)
 
-tab_visao, tab_processar, tab_template = st.tabs(["📊 Visão Geral", "📎 Processar Cliente", "✏️ Template de Email"])
+# --- Importar Clientes -------------------------------------------------
+with tab_importar:
+    st.subheader("Importar Clientes só de IRS")
+    st.caption(
+        "Usa isto para trazeres de uma vez uma lista de clientes que só têm IRS (não têm PPC nem outros "
+        "impostos). Entram no registo central da plataforma, mas já ficam com 'Aplica IRS' ligado "
+        "automaticamente, por isso nunca aparecem misturados nas contas de PPC ou de outro imposto — "
+        "podes vê-los à parte na página 'Clientes', usando o filtro 'Só IRS'."
+    )
+    up_irs_csv = st.file_uploader(
+        "Importar CSV ou Excel (colunas: NIF, Nome, Email, Gestor_Nome, Gestor_Email)",
+        type=["csv", "xlsx"],
+        key="up_irs_clientes_csv",
+    )
+    if up_irs_csv is not None:
+        try:
+            bruto_irs = ler_ficheiro_importacao(up_irs_csv)
+            novos_irs = clean_clientes_df(bruto_irs)
+            novos_irs["Aplica_IRS"] = True
+            st.markdown(f"**{len(novos_irs)} cliente(s) lidos do ficheiro:**")
+            st.dataframe(novos_irs[["NIF", "Nome", "Email", "Gestor_Nome", "Gestor_Email"]], use_container_width=True, hide_index=True)
+            if st.button("✅ Confirmar importação destes clientes de IRS"):
+                persistir_clientes(
+                    clean_clientes_df(pd.concat([st.session_state.clientes, novos_irs], ignore_index=True))
+                    .drop_duplicates(subset="NIF", keep="last")
+                )
+                st.success(f"{len(novos_irs)} cliente(s) importados/atualizados com 'Aplica IRS' ligado.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao importar: {e}")
+
+if base_irs.empty:
+    st.info("Ainda não há clientes com 'Aplica IRS' ligado — importa-os aqui em cima ou ativa o interruptor na página 'Clientes'.")
+    st.stop()
 
 # --- Visão Geral -----------------------------------------------------------
 with tab_visao:
