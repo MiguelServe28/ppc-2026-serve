@@ -70,7 +70,7 @@ if p["assinatura_html"]:
         st.markdown(p["assinatura_html"], unsafe_allow_html=True)
 
 if st.button("💾 Guardar configurações", type="primary"):
-    guardar_config_db(p, st.session_state.templates, st.session_state.get("template_irs"))
+    guardar_config_db(p, st.session_state.templates, st.session_state.get("template_irs"), st.session_state.get("template_ss"))
     st.success("Configurações guardadas para toda a equipa.")
 
 st.divider()
