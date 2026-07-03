@@ -30,24 +30,27 @@ from supabase import Client, create_client
 # Registo central de clientes (partilhado por toda a plataforma)
 # ---------------------------------------------------------------------------
 CLIENT_COLS = [
-    "NIF", "Nome", "Email", "Gestor_Nome", "Gestor_Email",
+    "NIF", "Numero_Cliente", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email",
     "Tipo_Empresa", "Tipo_AL", "Tipo_Trab_Independente", "Tipo_Rep_Fiscal",
     "Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_IRS", "Aplica_SS",
-    "Notas",
+    "IRS_Avulso", "Notas",
 ]
 TIPO_COLS = ["Tipo_Empresa", "Tipo_AL", "Tipo_Trab_Independente", "Tipo_Rep_Fiscal"]
 APLICA_COLS = ["Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_IRS", "Aplica_SS"]
-BOOL_COLS = TIPO_COLS + APLICA_COLS
-TEXT_COLS = ["NIF", "Nome", "Email", "Gestor_Nome", "Gestor_Email", "Notas"]
+# IRS_Avulso: cliente importado apenas pelo menu do IRS (não é cliente de avença
+# da base central) — permite separar "avença" de "só IRS" na Visão Geral do IRS.
+BOOL_COLS = TIPO_COLS + APLICA_COLS + ["IRS_Avulso"]
+# Lingua: "PT" ou "EN" — decide em que língua os emails deste cliente são enviados.
+TEXT_COLS = ["NIF", "Numero_Cliente", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email", "Notas"]
 
 COLUMN_MAP_TO_DB = {
-    "NIF": "nif", "Nome": "nome", "Email": "email",
-    "Gestor_Nome": "gestor_nome", "Gestor_Email": "gestor_email",
+    "NIF": "nif", "Numero_Cliente": "numero_cliente", "Nome": "nome", "Email": "email",
+    "Lingua": "lingua", "Gestor_Nome": "gestor_nome", "Gestor_Email": "gestor_email",
     "Tipo_Empresa": "tipo_empresa", "Tipo_AL": "tipo_al",
     "Tipo_Trab_Independente": "tipo_trabalhador_independente", "Tipo_Rep_Fiscal": "tipo_representacao_fiscal",
     "Aplica_PPC": "aplica_ppc", "Aplica_IVA": "aplica_iva", "Aplica_IMI": "aplica_imi",
     "Aplica_IRS": "aplica_irs", "Aplica_SS": "aplica_ss",
-    "Notas": "notas",
+    "IRS_Avulso": "irs_avulso", "Notas": "notas",
 }
 COLUMN_MAP_FROM_DB = {v: k for k, v in COLUMN_MAP_TO_DB.items()}
 
@@ -86,6 +89,21 @@ DEFAULT_TEMPLATES = {
             "Ficamos ao dispor para qualquer esclarecimento.\n\n"
             "Com os melhores cumprimentos,"
         ),
+        "assunto_en": "Payments on Account {ano_pagamentos} — {nome}",
+        "corpo_en": (
+            "Dear Sir or Madam,\n\n"
+            "Following the assessment of the {ano_dados} Corporate Income Tax (IRC), we inform you that {nome} "
+            "(tax no. {nif}) has payments on account due in {ano_pagamentos}, in the following amounts and deadlines:\n\n"
+            "• 1st Payment on Account: {pag1} € — by {data1}\n"
+            "• 2nd Payment on Account: {pag2} € — by {data2}\n"
+            "• 3rd Payment on Account: {pag3} € — by {data3}\n\n"
+            "Annual total: {total} €\n\n"
+            "Please find attached the payment form for the 1st payment. We kindly ask you to settle it by the date "
+            "indicated in order to avoid late-payment interest.\n\n"
+            "The payment forms for the 2nd and 3rd payments will be sent in due course.\n\n"
+            "We remain at your disposal for any clarification.\n\n"
+            "Best regards,"
+        ),
     },
     2: {
         "assunto": "2.º Pagamento por Conta {ano_pagamentos} — {nome}",
@@ -97,6 +115,15 @@ DEFAULT_TEMPLATES = {
             "Ficamos ao dispor para qualquer esclarecimento.\n\n"
             "Com os melhores cumprimentos,"
         ),
+        "assunto_en": "2nd Payment on Account {ano_pagamentos} — {nome}",
+        "corpo_en": (
+            "Dear Sir or Madam,\n\n"
+            "Following the 1st payment on account already made, we remind you that the 2nd payment on account "
+            "of {nome} (tax no. {nif}) is due on {data2}, in the amount of {pag2} €.\n\n"
+            "Please find the payment form attached.\n\n"
+            "We remain at your disposal for any clarification.\n\n"
+            "Best regards,"
+        ),
     },
     3: {
         "assunto": "3.º Pagamento por Conta {ano_pagamentos} — {nome}",
@@ -107,6 +134,15 @@ DEFAULT_TEMPLATES = {
             "Segue em anexo a respetiva guia.\n\n"
             "Ficamos ao dispor para qualquer esclarecimento.\n\n"
             "Com os melhores cumprimentos,"
+        ),
+        "assunto_en": "3rd Payment on Account {ano_pagamentos} — {nome}",
+        "corpo_en": (
+            "Dear Sir or Madam,\n\n"
+            "Following the payments on account already made, we remind you that the 3rd and final payment on "
+            "account of {nome} (tax no. {nif}) is due on {data3}, in the amount of {pag3} €.\n\n"
+            "Please find the payment form attached.\n\n"
+            "We remain at your disposal for any clarification.\n\n"
+            "Best regards,"
         ),
     },
 }
@@ -218,6 +254,10 @@ def clean_clientes_df(df: pd.DataFrame) -> pd.DataFrame:
         df[c] = df[c].fillna(False).astype(bool)
     for c in TEXT_COLS:
         df[c] = df[c].fillna("").astype(str).str.strip()
+    # Normaliza a língua: aceita "pt", "en", "Português", "English", etc. — tudo
+    # o que não começar por EN fica PT (a língua por omissão).
+    df["Lingua"] = df["Lingua"].str.upper().str[:2]
+    df.loc[~df["Lingua"].isin(["PT", "EN"]), "Lingua"] = "PT"
     return df[CLIENT_COLS]
 
 
@@ -389,12 +429,18 @@ def registar_log(entry: dict):
 
 def carregar_config_db():
     client = get_client()
-    resp = client.table("config").select("params_json, templates_json, templates_irs_json").eq("id", 1).execute()
+    try:
+        resp = client.table("config").select("params_json, templates_json, templates_irs_json, templates_ss_json").eq("id", 1).execute()
+    except Exception:
+        # A coluna templates_ss_json só existe a partir do v7 — se ainda não
+        # foi corrido, carrega sem ela para a app não deixar de funcionar.
+        resp = client.table("config").select("params_json, templates_json, templates_irs_json").eq("id", 1).execute()
     if not resp.data:
-        return None, None, None
+        return None, None, None, None
     row = resp.data[0]
     params_json, templates_json = row.get("params_json"), row.get("templates_json")
     templates_irs_json = row.get("templates_irs_json")
+    template_ss = row.get("templates_ss_json")
     params, templates, template_irs = None, None, None
     if params_json:
         params = {
@@ -410,10 +456,10 @@ def carregar_config_db():
         templates = {int(k): v for k, v in templates_json.items()}
     if templates_irs_json:
         template_irs = templates_irs_json
-    return params, templates, template_irs
+    return params, templates, template_irs, template_ss
 
 
-def guardar_config_db(params: dict, templates: dict, template_irs: dict = None):
+def guardar_config_db(params: dict, templates: dict, template_irs: dict = None, template_ss: dict = None):
     """Só o admin tem permissão (RLS) para escrever a configuração global."""
     if not sou_admin():
         return
@@ -424,8 +470,15 @@ def guardar_config_db(params: dict, templates: dict, template_irs: dict = None):
     registo = {"id": 1, "params_json": params_serializ, "templates_json": templates_serializ}
     if template_irs is not None:
         registo["templates_irs_json"] = template_irs
+    if template_ss is not None:
+        registo["templates_ss_json"] = template_ss
     client = get_client()
-    client.table("config").upsert(registo).execute()
+    try:
+        client.table("config").upsert(registo).execute()
+    except Exception:
+        # Sem a coluna do v7 ainda, grava o resto na mesma.
+        registo.pop("templates_ss_json", None)
+        client.table("config").upsert(registo).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -444,8 +497,9 @@ def init_state():
         # PDFs de guias PPC carregados cujo nome não tinha NIF — ficam aqui à
         # espera de associação manual; depois de associados vão para o Storage.
         st.session_state.guias_por_associar = {}  # {(n_pag, filename): bytes}
-    if "params" not in st.session_state or "templates" not in st.session_state or "template_irs" not in st.session_state:
-        params_db, templates_db, template_irs_db = carregar_config_db()
+    if ("params" not in st.session_state or "templates" not in st.session_state
+            or "template_irs" not in st.session_state or "template_ss" not in st.session_state):
+        params_db, templates_db, template_irs_db, template_ss_db = carregar_config_db()
         if "params" not in st.session_state:
             st.session_state.params = params_db or {
                 "limiar_volume": 500000.0,
@@ -463,6 +517,8 @@ def init_state():
             st.session_state.templates = templates_db or {k: v.copy() for k, v in DEFAULT_TEMPLATES.items()}
         if "template_irs" not in st.session_state:
             st.session_state.template_irs = template_irs_db or DEFAULT_TEMPLATE_IRS.copy()
+        if "template_ss" not in st.session_state:
+            st.session_state.template_ss = template_ss_db or DEFAULT_TEMPLATE_SS.copy()
     if "log_envio" not in st.session_state:
         st.session_state.log_envio = carregar_log_db()
 
@@ -518,7 +574,16 @@ def ler_ficheiro_importacao(uploaded_file) -> pd.DataFrame:
         for c in df.columns:
             if c == base or re.fullmatch(rf"{base}_\d{{4}}", c):
                 aliases[c] = base
+    # O N.º interno do cliente pode vir escrito de várias formas.
+    for c in df.columns:
+        if c in ("N.º", "Nº", "N.o", "N°", "No.", "Numero", "Número", "Num", "Numero_Cliente", "N.º Cliente"):
+            aliases[c] = "Numero_Cliente"
     df = df.rename(columns=aliases)
+    if "Numero_Cliente" in df.columns:
+        df["Numero_Cliente"] = (
+            df["Numero_Cliente"].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        )
+        df.loc[df["Numero_Cliente"] == "nan", "Numero_Cliente"] = ""
     for c in ("Volume", "Coleta", "Retencoes"):
         if c in df.columns:
             df[c] = parse_numero_pt(df[c])
@@ -644,7 +709,26 @@ def formatar_valor(v):
     return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def lingua_cliente(row) -> str:
+    """Língua do cliente ('PT' ou 'EN') — vem do registo central. Tudo o que
+    não for EN conta como PT."""
+    try:
+        valor = str(row.get("Lingua", "PT") or "PT")
+    except Exception:
+        valor = "PT"
+    return "EN" if valor.strip().upper().startswith("EN") else "PT"
+
+
+def texto_template(template: dict, chave: str, lingua: str) -> str:
+    """Devolve o texto do template na língua pedida. Se a versão EN estiver
+    vazia (ainda não preenchida), usa a PT — nunca falha."""
+    if lingua == "EN":
+        return (template.get(f"{chave}_en") or "").strip() or template[chave]
+    return template[chave]
+
+
 def render_template(template: dict, row: pd.Series, params: dict) -> tuple[str, str]:
+    lingua = lingua_cliente(row)
     ctx = {
         "nome": row["Nome"],
         "nif": row["NIF"],
@@ -659,9 +743,22 @@ def render_template(template: dict, row: pd.Series, params: dict) -> tuple[str, 
         "ano_dados": params.get("ano_dados", 2025),
         "ano_pagamentos": params.get("ano_pagamentos", 2026),
     }
-    assunto = template["assunto"].format(**ctx)
-    corpo = template["corpo"].format(**ctx)
+    assunto = texto_template(template, "assunto", lingua).format(**ctx)
+    corpo = texto_template(template, "corpo", lingua).format(**ctx)
     return assunto, corpo
+
+
+def editor_template_bilingue(tpl: dict, prefixo_key: str, altura: int = 260):
+    """Widget partilhado: edita o assunto/corpo de um template em PT e EN
+    (dois separadores). Altera o dicionário 'tpl' diretamente."""
+    tab_pt, tab_en = st.tabs(["🇵🇹 Português", "🇬🇧 English"])
+    with tab_pt:
+        tpl["assunto"] = st.text_input("Assunto (PT)", value=tpl.get("assunto", ""), key=f"{prefixo_key}_assunto_pt")
+        tpl["corpo"] = st.text_area("Corpo (PT)", value=tpl.get("corpo", ""), height=altura, key=f"{prefixo_key}_corpo_pt")
+    with tab_en:
+        tpl["assunto_en"] = st.text_input("Assunto (EN)", value=tpl.get("assunto_en", ""), key=f"{prefixo_key}_assunto_en")
+        tpl["corpo_en"] = st.text_area("Corpo (EN)", value=tpl.get("corpo_en", ""), height=altura, key=f"{prefixo_key}_corpo_en")
+        st.caption("Se deixares a versão EN vazia, os clientes EN recebem a versão PT.")
 
 
 def enviar_email(smtp_cfg, destinatario, assunto, corpo, anexos, cc=None, assinatura_html=""):
@@ -946,6 +1043,17 @@ DEFAULT_TEMPLATE_IRS = {
         "Ficamos ao dispor para qualquer esclarecimento.\n\n"
         "Com os melhores cumprimentos,"
     ),
+    "assunto_en": "Personal Income Tax (IRS) Assessment — {nome}",
+    "corpo_en": (
+        "Dear Sir or Madam,\n\n"
+        "Please find attached the Personal Income Tax (IRS) Assessment Statement for the year {ano_dados} "
+        "(tax no. {nif}{ref_liquidacao}).\n\n"
+        "{frase_valor}\n\n"
+        "{frase_pendente}"
+        "The payment form is also attached, where applicable.\n\n"
+        "We remain at your disposal for any clarification.\n\n"
+        "Best regards,"
+    ),
 }
 
 
@@ -1113,24 +1221,43 @@ def extrair_dados_pendentes_irs(ficheiro_bytes: bytes) -> dict:
 
 
 def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
+    lingua = lingua_cliente(row)
     valor = row.get("Valor_Apurado", 0.0) or 0.0
-    if valor > 0:
-        frase_valor = f"Do apuramento efetuado, resulta um valor a pagar de {formatar_valor(valor)} €."
-    elif valor < 0:
-        frase_valor = f"Do apuramento efetuado, resulta um valor a receber (reembolso) de {formatar_valor(abs(valor))} €."
+    if lingua == "EN":
+        if valor > 0:
+            frase_valor = f"The assessment results in an amount payable of {formatar_valor(valor)} €."
+        elif valor < 0:
+            frase_valor = f"The assessment results in a refund of {formatar_valor(abs(valor))} €."
+        else:
+            frase_valor = "The assessment results in no amount payable or refundable."
     else:
-        frase_valor = "Do apuramento efetuado, não resulta qualquer valor a pagar ou a receber."
+        if valor > 0:
+            frase_valor = f"Do apuramento efetuado, resulta um valor a pagar de {formatar_valor(valor)} €."
+        elif valor < 0:
+            frase_valor = f"Do apuramento efetuado, resulta um valor a receber (reembolso) de {formatar_valor(abs(valor))} €."
+        else:
+            frase_valor = "Do apuramento efetuado, não resulta qualquer valor a pagar ou a receber."
 
     pendente = row.get("Valor_Pendente", 0.0) or 0.0
     if pendente > 0:
-        frase_pendente = (
-            f"Informamos ainda que, de acordo com os nossos registos, tem pendente o valor de "
-            f"{formatar_valor(pendente)} € referente a honorários em dívida à SERVE.\n\n"
-        )
+        if lingua == "EN":
+            frase_pendente = (
+                f"We would also like to inform you that, according to our records, an amount of "
+                f"{formatar_valor(pendente)} € remains outstanding to SERVE for professional fees.\n\n"
+            )
+        else:
+            frase_pendente = (
+                f"Informamos ainda que, de acordo com os nossos registos, tem pendente o valor de "
+                f"{formatar_valor(pendente)} € referente a honorários em dívida à SERVE.\n\n"
+            )
     else:
         frase_pendente = ""
 
-    ref_liquidacao = f", n.º de liquidação {row['Numero_Liquidacao']}" if row.get("Numero_Liquidacao") else ""
+    if row.get("Numero_Liquidacao"):
+        ref_liquidacao = (f", assessment no. {row['Numero_Liquidacao']}" if lingua == "EN"
+                          else f", n.º de liquidação {row['Numero_Liquidacao']}")
+    else:
+        ref_liquidacao = ""
 
     params = st.session_state.get("params", {})
     ctx = {
@@ -1143,8 +1270,8 @@ def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
         "ano_dados": params.get("ano_dados", 2025),
         "ano_pagamentos": params.get("ano_pagamentos", 2026),
     }
-    assunto = template["assunto"].format(**ctx)
-    corpo = template["corpo"].format(**ctx)
+    assunto = texto_template(template, "assunto", lingua).format(**ctx)
+    corpo = texto_template(template, "corpo", lingua).format(**ctx)
     return assunto, corpo
 
 
@@ -1171,9 +1298,9 @@ def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
     ws.merge_cells("A1:D1")
 
     headers = [
-        "NIF", "Nome", "Email", "Gestor (nome)", "Gestor (email)",
+        "N.º", "NIF", "Nome", "Email",
         "Nº Liquidação", "Valor Apurado (€)", "Pendente à SERVE (€)",
-        "Incluído na Avença", "Email Enviado", "Notas",
+        "Incluído na Avença", "Email Enviado", "Só IRS (avulso)", "Notas",
     ]
     for i, h in enumerate(headers, start=1):
         c = ws.cell(row=4, column=i, value=h)
@@ -1183,24 +1310,25 @@ def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
         c.border = BORDER
     ws.row_dimensions[4].height = 30
 
-    widths = [12, 26, 24, 18, 24, 16, 15, 15, 12, 12, 20]
+    widths = [9, 12, 26, 24, 16, 15, 15, 12, 12, 12, 20]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     row = 5
     for _, r in base_irs.iterrows():
         vals = [
-            r["NIF"], r["Nome"], r["Email"], r["Gestor_Nome"], r["Gestor_Email"],
+            r.get("Numero_Cliente", ""), r["NIF"], r["Nome"], r["Email"],
             r["Numero_Liquidacao"], r["Valor_Apurado"], r["Valor_Pendente"],
             "Sim" if r["Incluido_Avenca"] else "Não",
             "Sim" if r["Email_Enviado"] else "Não",
+            "Sim" if r.get("IRS_Avulso", False) else "Não",
             r.get("Notas", ""),
         ]
         for i, v in enumerate(vals, start=1):
             c = ws.cell(row=row, column=i, value=v)
             c.font = BLACK
             c.border = BORDER
-            if i in (7, 8):
+            if i in (6, 7):
                 c.number_format = "#,##0.00"
         if r["Email_Enviado"]:
             for i in range(1, len(vals) + 1):
@@ -1210,3 +1338,140 @@ def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Segurança Social (DMR/DRI) — envio mensal de declarações e guias.
+# Estado "email enviado" guardado por cliente e por mês na tabela ss_dados.
+# Documentos no Storage: ss/<mes>/guia/<nif>.pdf, ss/<mes>/dmr/<nif>.pdf e
+# extras em ss/<mes>/extra/<nif>__<nome do ficheiro>.
+# ---------------------------------------------------------------------------
+MESES_PT = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
+            "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+MESES_EN = ["January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"]
+
+DEFAULT_TEMPLATE_SS = {
+    "assunto": "Segurança Social — {mes_nome} — {nome}",
+    "corpo": (
+        "Exmo(a). Sr(a).,\n\n"
+        "Junto enviamos a documentação da Segurança Social referente a {mes_nome}: {lista_docs}.\n\n"
+        "O pagamento deverá ser efetuado até {data_limite}.\n\n"
+        "Ficamos ao dispor para qualquer esclarecimento.\n\n"
+        "Com os melhores cumprimentos,"
+    ),
+    "assunto_en": "Social Security — {mes_nome} — {nome}",
+    "corpo_en": (
+        "Dear Sir or Madam,\n\n"
+        "Please find attached the Social Security documentation for {mes_nome}: {lista_docs}.\n\n"
+        "Payment should be made by {data_limite}.\n\n"
+        "We remain at your disposal for any clarification.\n\n"
+        "Best regards,"
+    ),
+}
+
+
+def nome_mes(mes: str, lingua: str = "PT") -> str:
+    """'2026-06' -> 'junho de 2026' (PT) ou 'June 2026' (EN)."""
+    ano, m = mes.split("-")
+    m = int(m)
+    return f"{MESES_EN[m - 1]} {ano}" if lingua == "EN" else f"{MESES_PT[m - 1]} de {ano}"
+
+
+def data_limite_ss(mes: str) -> date:
+    """Dia 25 do mês seguinte ao mês de referência (remunerações de junho ->
+    pagamento até 25 de julho)."""
+    ano, m = (int(x) for x in mes.split("-"))
+    m += 1
+    if m == 13:
+        m, ano = 1, ano + 1
+    return date(ano, m, 25)
+
+
+def lista_meses_ss(quantos: int = 18) -> list:
+    """Meses de referência disponíveis no seletor, do mais recente para trás,
+    a começar no mês atual."""
+    hoje = date.today()
+    ano, m = hoje.year, hoje.month
+    meses = []
+    for _ in range(quantos):
+        meses.append(f"{ano:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            m, ano = 12, ano - 1
+    return meses
+
+
+def carregar_ss_mes_db(mes: str) -> dict:
+    """Estado 'email enviado' de todos os clientes num mês: {nif: True/False}."""
+    try:
+        resp = get_client().table("ss_dados").select("nif, email_enviado").eq("mes", mes).execute()
+        return {r["nif"]: bool(r["email_enviado"]) for r in (resp.data or [])}
+    except Exception:
+        return {}  # tabela ainda não criada (v7 por correr)
+
+
+def marcar_ss_enviado_db(nif: str, mes: str, enviado: bool = True):
+    get_client().table("ss_dados").upsert(
+        {"nif": nif, "mes": mes, "email_enviado": enviado}, on_conflict="nif,mes"
+    ).execute()
+
+
+def montar_base_ss() -> pd.DataFrame:
+    """Clientes com 'Aplica SS' ligado (o estado por mês junta-se na página)."""
+    clientes = clean_clientes_df(st.session_state.clientes)
+    return clientes[clientes["Aplica_SS"]].copy()
+
+
+def docs_ss_cliente(mes: str, nif: str, guias_set: set, dmrs_set: set, extras_dict: dict) -> list:
+    """Lista dos documentos disponíveis para um cliente neste mês, a partir dos
+    conjuntos já lidos do Storage (para não fazer chamadas a mais):
+    devolve ex: ["guia", "dmr", "extra:Recibo.pdf"]."""
+    docs = []
+    if nif in guias_set:
+        docs.append("guia")
+    if nif in dmrs_set:
+        docs.append("dmr")
+    for nome_extra in extras_dict.get(nif, []):
+        docs.append(f"extra:{nome_extra}")
+    return docs
+
+
+def listar_extras_ss(mes: str) -> dict:
+    """Extras carregados no mês, agrupados por NIF: {nif: [nome1.pdf, ...]}."""
+    extras = {}
+    for nome in storage_listar(f"ss/{mes}/extra"):
+        if "__" in nome:
+            nif, nome_ficheiro = nome.split("__", 1)
+            extras.setdefault(nif, []).append(nome_ficheiro)
+    return extras
+
+
+def render_template_ss(template: dict, row: pd.Series, mes: str, docs: list) -> tuple[str, str]:
+    """Monta o email da Segurança Social na língua do cliente. 'docs' é a lista
+    devolvida por docs_ss_cliente — usada para escrever a frase dos anexos."""
+    lingua = lingua_cliente(row)
+    partes = []
+    for d in docs:
+        if d == "guia":
+            partes.append("payment form" if lingua == "EN" else "guia de pagamento")
+        elif d == "dmr":
+            partes.append("DMR")
+        elif d.startswith("extra:"):
+            partes.append(d.split(":", 1)[1])
+    if partes:
+        lista_docs = ", ".join(partes)
+    else:
+        lista_docs = "the attached documents" if lingua == "EN" else "os documentos em anexo"
+
+    ctx = {
+        "nome": row["Nome"],
+        "nif": row["NIF"],
+        "email": row["Email"],
+        "mes_nome": nome_mes(mes, lingua),
+        "data_limite": data_limite_ss(mes).strftime("%d/%m/%Y"),
+        "lista_docs": lista_docs,
+    }
+    assunto = texto_template(template, "assunto", lingua).format(**ctx)
+    corpo = texto_template(template, "corpo", lingua).format(**ctx)
+    return assunto, corpo
