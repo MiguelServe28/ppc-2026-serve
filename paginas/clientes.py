@@ -75,8 +75,8 @@ with col1:
             st.error(f"Erro ao importar: {e}")
 with col2:
     template_csv = pd.DataFrame(
-        [{"NIF": "500123456", "Nome": "Empresa Exemplo, Lda.", "Email": "geral@exemplo.pt",
-          "Gestor_Nome": "Ana Gestora", "Gestor_Email": "ana@serve.pt",
+        [{"N.º": "123", "NIF": "500123456", "Nome": "Empresa Exemplo, Lda.", "Email": "geral@exemplo.pt",
+          "Lingua": "PT", "Gestor_Nome": "Ana Gestora", "Gestor_Email": "ana@serve.pt",
           "Volume": 10000, "Coleta": 2000, "Retencoes": 200}]
     ).to_csv(index=False, sep=";")
     st.download_button("📥 Template CSV", template_csv, file_name="template_clientes.csv", mime="text/csv")
@@ -133,6 +133,9 @@ if invalidos_atuais:
 
 st.markdown("**Tabela de clientes** — pode editar diretamente, adicionar ou apagar linhas.")
 col_config = {
+    "Numero_Cliente": st.column_config.TextColumn("N.º"),
+    "Lingua": st.column_config.SelectboxColumn("Língua", options=["PT", "EN"], help="Os emails deste cliente são enviados nesta língua (em todos os módulos)."),
+    "IRS_Avulso": st.column_config.CheckboxColumn("Só IRS (avulso)", help="Cliente importado apenas pelo menu do IRS — não é cliente de avença."),
     "Tipo_Empresa": st.column_config.CheckboxColumn("Empresa"),
     "Tipo_AL": st.column_config.CheckboxColumn("Aloj. Local"),
     "Tipo_Trab_Independente": st.column_config.CheckboxColumn("Trab. Independente"),
