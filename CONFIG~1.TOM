@@ -1,0 +1,7 @@
+# Tema visual da plataforma — cores da SERVE (o mesmo azul do Excel de controlo).
+[theme]
+primaryColor = "#1F4E78"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F4F8"
+textColor = "#1A1A2E"
+font = "sans serif"
