@@ -3,9 +3,10 @@ Página de IRS — tudo o que é específico deste imposto vive aqui: dados de
 liquidação por cliente (lidos automaticamente dos PDFs sempre que possível,
 mas sempre confirmáveis/editáveis antes de gravar ou enviar), upload de guia,
 nota de liquidação e controlo de pendentes, e envio do respetivo email.
+A guia e a fatura ficam guardadas no arquivo persistente (Supabase Storage).
 """
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -17,22 +18,30 @@ from common import (
     escolher_conta_email,
     extrair_dados_liquidacao_irs,
     extrair_dados_pendentes_irs,
+    formatar_valor,
+    gerar_excel_irs,
     guardar_config_db,
     ler_ficheiro_importacao,
+    meu_email,
     montar_base_irs,
     persistir_clientes,
     persistir_irs,
     registar_log,
     render_template_irs,
     sou_admin,
+    storage_download_pdf,
+    storage_listar,
+    storage_upload_pdf,
 )
 
-st.title("🧾 IRS — Liquidações")
+ano_dados = st.session_state.params.get("ano_dados", 2025)
+
+st.title(f"🧾 IRS — Liquidações {ano_dados}")
 st.caption("SERVE — Contabilidade e Viabilização Empresarial")
 st.caption(
-    "Cada cliente é tratado individualmente: seleciona o cliente, carrega os 3 documentos "
+    "Cada cliente é tratado individualmente: seleciona o cliente, carrega os documentos "
     "(Guia, Nota de Liquidação e, se aplicável, o Controlo de Pendentes), confirma os valores "
-    "lidos automaticamente e envia o email."
+    "lidos automaticamente e envia o email. A guia e a fatura ficam guardadas no arquivo — não se perdem ao fechar o browser."
 )
 
 base_irs = montar_base_irs()
@@ -62,6 +71,10 @@ with tab_importar:
             novos_irs["Aplica_IRS"] = True
             st.markdown(f"**{len(novos_irs)} cliente(s) lidos do ficheiro:**")
             st.dataframe(novos_irs[["NIF", "Nome", "Email", "Gestor_Nome", "Gestor_Email"]], use_container_width=True, hide_index=True)
+            from common import nifs_invalidos
+            invalidos = nifs_invalidos(novos_irs)
+            if invalidos:
+                st.warning(f"⚠️ NIFs com dígito de controlo inválido (confirma se estão bem escritos): {', '.join(invalidos)}")
             if st.button("✅ Confirmar importação destes clientes de IRS"):
                 persistir_clientes(
                     clean_clientes_df(pd.concat([st.session_state.clientes, novos_irs], ignore_index=True))
@@ -89,10 +102,21 @@ with tab_visao:
         hide_index=True,
         height=400,
     )
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total de Clientes IRS", len(base_irs))
     c2.metric("A Pagar", int((base_irs["Valor_Apurado"] > 0).sum()))
     c3.metric("A Receber (reembolso)", int((base_irs["Valor_Apurado"] < 0).sum()))
+    c4.metric("Emails Enviados", f"{int(base_irs['Email_Enviado'].sum())} / {len(base_irs)}")
+
+    st.divider()
+    excel_irs = gerar_excel_irs(base_irs, st.session_state.params)
+    st.download_button(
+        "⬇️ Descarregar Excel de Controlo (IRS)",
+        data=excel_irs,
+        file_name=f"Controlo_IRS_{ano_dados}_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.caption("Clientes com email já enviado ficam destacados a verde no Excel.")
 
 # --- Processar Cliente -------------------------------------------------
 with tab_processar:
@@ -104,6 +128,7 @@ with tab_processar:
         key="irs_cliente_escolhido",
     )
     row_atual = base_irs[base_irs["NIF"] == nif_escolhido].iloc[0]
+    ficheiros_arquivo = storage_listar(f"irs/{nif_escolhido}")
 
     st.divider()
     incluido_avenca = st.checkbox(
@@ -120,19 +145,25 @@ with tab_processar:
     with col_g:
         up_guia = st.file_uploader("Guia de Pagamento (PDF)", type=["pdf"], key=f"up_guia_irs_{nif_escolhido}")
         if up_guia is not None:
-            st.session_state.guias_irs[nif_escolhido] = (up_guia.name, up_guia.read())
-        tem_guia = nif_escolhido in st.session_state.guias_irs
-        st.caption("✅ Guia carregada" if tem_guia else "❌ Sem guia carregada ainda")
+            fid = f"{up_guia.name}_{up_guia.size}"
+            if st.session_state.get(f"_guia_irs_proc_{nif_escolhido}") != fid:
+                storage_upload_pdf(f"irs/{nif_escolhido}/guia.pdf", up_guia.getvalue())
+                st.session_state[f"_guia_irs_proc_{nif_escolhido}"] = fid
+                ficheiros_arquivo.add("guia.pdf")
+        tem_guia = "guia.pdf" in ficheiros_arquivo
+        st.caption("✅ Guia no arquivo" if tem_guia else "❌ Sem guia no arquivo ainda")
 
     if col_f is not None:
         with col_f:
             up_fatura = st.file_uploader("Fatura do Serviço de IRS (PDF)", type=["pdf"], key=f"up_fatura_irs_{nif_escolhido}")
             if up_fatura is not None:
-                st.session_state.faturas_irs[nif_escolhido] = (up_fatura.name, up_fatura.read())
-            tem_fatura = nif_escolhido in st.session_state.faturas_irs
-            st.caption("✅ Fatura carregada" if tem_fatura else "❌ Sem fatura carregada ainda")
-    else:
-        st.session_state.faturas_irs.pop(nif_escolhido, None)
+                fid = f"{up_fatura.name}_{up_fatura.size}"
+                if st.session_state.get(f"_fatura_irs_proc_{nif_escolhido}") != fid:
+                    storage_upload_pdf(f"irs/{nif_escolhido}/fatura.pdf", up_fatura.getvalue())
+                    st.session_state[f"_fatura_irs_proc_{nif_escolhido}"] = fid
+                    ficheiros_arquivo.add("fatura.pdf")
+            tem_fatura = "fatura.pdf" in ficheiros_arquivo
+            st.caption("✅ Fatura no arquivo" if tem_fatura else "❌ Sem fatura no arquivo ainda")
 
     with col_l:
         up_liq = st.file_uploader("Nota de Liquidação (PDF)", type=["pdf"], key=f"up_liq_irs_{nif_escolhido}")
@@ -148,9 +179,7 @@ with tab_processar:
                 st.warning("Não consegui ler o valor automaticamente neste PDF — preenche manualmente abaixo.")
             else:
                 rotulo_legivel = {"a pagar": "a pagar", "a receber": "a receber (reembolso)", "apurado": "apurado (sem valor a pagar/receber)"}.get(dados_liq["tipo_valor"], "")
-                st.success(
-                    f"Valor {rotulo_legivel}: {abs(dados_liq['valor_apurado']):,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
-                )
+                st.success(f"Valor {rotulo_legivel}: {formatar_valor(abs(dados_liq['valor_apurado']))} €")
             # Um widget com "key" só usa o "value=" passado na primeira vez que é criado — depois disso,
             # o Streamlit mantém o que já está gravado em session_state para essa key. Por isso, sempre que
             # detetamos um ficheiro novo (nome+tamanho diferente do último processado para este cliente),
@@ -174,7 +203,7 @@ with tab_processar:
             if dados_pend["valor_pendente"] is None:
                 st.warning("Não consegui ler o total pendente automaticamente — preenche manualmente abaixo, se aplicável.")
             else:
-                st.success(f"Total pendente lido: {dados_pend['valor_pendente']:,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
+                st.success(f"Total pendente lido: {formatar_valor(dados_pend['valor_pendente'])} €")
             ficheiro_id_pend = f"{up_pend.name}_{up_pend.size}"
             chave_rastreio_pend = f"_pend_processado_{nif_escolhido}"
             if st.session_state.get(chave_rastreio_pend) != ficheiro_id_pend:
@@ -228,17 +257,17 @@ with tab_processar:
         st.caption("📋 CC: — (sem gestor definido para este cliente)")
     st.text_area("Corpo (preview)", value=corpo, height=280, disabled=True)
 
-    anexos_disponiveis = []
-    if nif_escolhido in st.session_state.guias_irs:
-        anexos_disponiveis.append(("Guia", st.session_state.guias_irs[nif_escolhido]))
+    anexos_previstos = []
+    if "guia.pdf" in ficheiros_arquivo:
+        anexos_previstos.append("Guia")
     if up_liq is not None:
-        anexos_disponiveis.append(("Nota de Liquidação", (up_liq.name, up_liq.getvalue())))
+        anexos_previstos.append("Nota de Liquidação")
     if up_pend is not None:
-        anexos_disponiveis.append(("Controlo de Pendentes", (up_pend.name, up_pend.getvalue())))
-    if not incluido_avenca and nif_escolhido in st.session_state.faturas_irs:
-        anexos_disponiveis.append(("Fatura", st.session_state.faturas_irs[nif_escolhido]))
-    st.caption("📎 Anexos que vão ser enviados: " + (", ".join(a[0] for a in anexos_disponiveis) if anexos_disponiveis else "nenhum carregado ainda"))
-    if not incluido_avenca and nif_escolhido not in st.session_state.faturas_irs:
+        anexos_previstos.append("Controlo de Pendentes")
+    if not incluido_avenca and "fatura.pdf" in ficheiros_arquivo:
+        anexos_previstos.append("Fatura")
+    st.caption("📎 Anexos que vão ser enviados: " + (", ".join(anexos_previstos) if anexos_previstos else "nenhum carregado ainda"))
+    if not incluido_avenca and "fatura.pdf" not in ficheiros_arquivo:
         st.caption("⚠️ Este cliente não tem o serviço incluído na avença e ainda não carregaste a fatura — normalmente deve ir junto.")
 
     if not row_atual["Email"]:
@@ -252,9 +281,23 @@ with tab_processar:
             st.error("Escolhe ou cria uma conta de email com utilizador e password preenchidos.")
         else:
             try:
+                anexos = []
+                if "guia.pdf" in ficheiros_arquivo:
+                    conteudo = storage_download_pdf(f"irs/{nif_escolhido}/guia.pdf")
+                    if conteudo:
+                        anexos.append((f"Guia_IRS_{nif_escolhido}.pdf", conteudo))
+                if up_liq is not None:
+                    anexos.append((up_liq.name, up_liq.getvalue()))
+                if up_pend is not None:
+                    anexos.append((up_pend.name, up_pend.getvalue()))
+                if not incluido_avenca and "fatura.pdf" in ficheiros_arquivo:
+                    conteudo = storage_download_pdf(f"irs/{nif_escolhido}/fatura.pdf")
+                    if conteudo:
+                        anexos.append((f"Fatura_{nif_escolhido}.pdf", conteudo))
+
                 cc_gestor = [row_atual["Gestor_Email"]] if row_atual["Gestor_Email"] else []
-                anexos = [f for _, f in anexos_disponiveis]
-                enviar_email(smtp_cfg, row_atual["Email"], assunto, corpo, anexos, cc=cc_gestor)
+                enviar_email(smtp_cfg, row_atual["Email"], assunto, corpo, anexos, cc=cc_gestor,
+                             assinatura_html=st.session_state.params.get("assinatura_html", ""))
 
                 novo_irs = pd.DataFrame(st.session_state.irs_dados)
                 novo_irs = novo_irs[novo_irs["NIF"] != nif_escolhido]
@@ -267,14 +310,16 @@ with tab_processar:
 
                 registar_log({
                     "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif_escolhido,
-                    "nome": row_atual["Nome"], "pagamento": 0, "estado": "IRS - Enviado",
+                    "nome": row_atual["Nome"], "pagamento": 0, "estado": "Enviado",
+                    "modulo": "IRS", "enviado_por": meu_email(),
                 })
                 st.success(f"Email enviado a {row_atual['Nome']} e estado guardado.")
                 st.rerun()
             except Exception as e:
                 registar_log({
                     "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif_escolhido,
-                    "nome": row_atual["Nome"], "pagamento": 0, "estado": f"IRS - Erro: {e}",
+                    "nome": row_atual["Nome"], "pagamento": 0, "estado": f"Erro: {e}",
+                    "modulo": "IRS", "enviado_por": meu_email(),
                 })
                 st.error(f"Erro ao enviar: {e}")
 
@@ -286,7 +331,7 @@ with tab_template:
         tpl["assunto"] = st.text_input("Assunto", value=tpl["assunto"], key="irs_tpl_assunto")
         tpl["corpo"] = st.text_area("Corpo", value=tpl["corpo"], height=320, key="irs_tpl_corpo")
         st.caption(
-            "Placeholders disponíveis: {nome} {nif} {email} {ref_liquidacao} {frase_valor} {frase_pendente}. "
+            "Placeholders disponíveis: {nome} {nif} {email} {ref_liquidacao} {frase_valor} {frase_pendente} {ano_dados} {ano_pagamentos}. "
             "{ref_liquidacao} já vem formatado como ', n.º de liquidação XXXX' (ou vazio, se não houver). "
             "{frase_valor} e {frase_pendente} são frases já prontas, geradas automaticamente a partir dos valores — não precisas de os escrever à mão."
         )
