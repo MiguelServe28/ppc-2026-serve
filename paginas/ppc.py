@@ -13,6 +13,7 @@ from common import (
     PPC_COLS,
     calcular_ppc,
     enviar_email,
+    escolher_conta_email,
     extrair_nif_de_filename,
     gerar_excel_ppc,
     guardar_config_db,
@@ -20,7 +21,6 @@ from common import (
     persistir_ppc,
     registar_log,
     render_template,
-    smtp_config_form,
     sou_admin,
 )
 
@@ -263,7 +263,7 @@ with tab_emails:
             st.write("📎 Guia anexada:", "✅ Sim" if tem_guia else "❌ Não carregada (aba Guias)")
 
         st.divider()
-        smtp_cfg = smtp_config_form()
+        smtp_cfg = escolher_conta_email("ppc")
 
         com_guia = [n for n in elegiveis["NIF"].tolist() if (n, n_pag_email) in st.session_state.guias]
         sem_guia = [n for n in elegiveis["NIF"].tolist() if n not in com_guia]
@@ -304,7 +304,7 @@ with tab_emails:
 
         if st.button("🚀 Enviar Emails Selecionados", type="primary", disabled=not selecionados):
             if not smtp_cfg["utilizador"] or not smtp_cfg["password"]:
-                st.error("Preencher utilizador e password SMTP.")
+                st.error("Escolhe ou cria uma conta de email com utilizador e password preenchidos.")
             else:
                 progress = st.progress(0.0)
                 status_box = st.empty()
