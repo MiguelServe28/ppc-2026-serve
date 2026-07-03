@@ -15,6 +15,7 @@ from common import (
     clean_ppc_df,
     ler_ficheiro_importacao,
     meu_email,
+    nifs_invalidos,
     persistir_clientes,
     persistir_clientes_parcial,
     persistir_ppc,
@@ -34,7 +35,8 @@ col1, col2 = st.columns([2, 1])
 with col1:
     up = st.file_uploader(
         "Importar CSV ou Excel (colunas mínimas: NIF, Nome, Email, Gestor_Nome, Gestor_Email; "
-        "opcionalmente também Volume_2025, Coleta_2025, Retencoes_2025 para já entrarem no PPC)",
+        "opcionalmente também Volume, Coleta, Retencoes para já entrarem no PPC — os nomes antigos "
+        "com ano, tipo Volume_2025, também são aceites)",
         type=["csv", "xlsx"],
     )
     if up is not None:
@@ -43,6 +45,9 @@ with col1:
             tem_dados_ppc = any(c in bruto.columns for c in PPC_NUM_COLS)
 
             novo_clientes = clean_clientes_df(bruto)
+            invalidos_import = nifs_invalidos(novo_clientes)
+            if invalidos_import:
+                st.warning(f"⚠️ Este ficheiro tem NIFs com dígito de controlo inválido (confirma se estão bem escritos): {', '.join(invalidos_import)}")
             if tem_dados_ppc:
                 novo_clientes["Aplica_PPC"] = True  # importação clássica de PPC -> liga logo o interruptor
 
@@ -72,7 +77,7 @@ with col2:
     template_csv = pd.DataFrame(
         [{"NIF": "500123456", "Nome": "Empresa Exemplo, Lda.", "Email": "geral@exemplo.pt",
           "Gestor_Nome": "Ana Gestora", "Gestor_Email": "ana@serve.pt",
-          "Volume_2025": 10000, "Coleta_2025": 2000, "Retencoes_2025": 200}]
+          "Volume": 10000, "Coleta": 2000, "Retencoes": 200}]
     ).to_csv(index=False, sep=";")
     st.download_button("📥 Template CSV", template_csv, file_name="template_clientes.csv", mime="text/csv")
 
@@ -86,12 +91,21 @@ FILTROS_IMPOSTO = {
     "Só Segurança Social": "Aplica_SS",
     "Sem nenhum imposto atribuído": "__nenhum__",
 }
-filtro_escolhido = st.selectbox(
-    "Mostrar",
-    list(FILTROS_IMPOSTO.keys()),
-    key="filtro_clientes",
-    help="Filtra a tabela abaixo — útil para veres só os clientes de um imposto (ex: os que só têm IRS) sem os teres misturados visualmente com os restantes.",
-)
+col_filtro, col_pesquisa = st.columns([1, 2])
+with col_filtro:
+    filtro_escolhido = st.selectbox(
+        "Mostrar",
+        list(FILTROS_IMPOSTO.keys()),
+        key="filtro_clientes",
+        help="Filtra a tabela abaixo — útil para veres só os clientes de um imposto (ex: os que só têm IRS) sem os teres misturados visualmente com os restantes.",
+    )
+with col_pesquisa:
+    pesquisa = st.text_input(
+        "🔍 Pesquisar por nome ou NIF",
+        key="pesquisa_clientes",
+        placeholder="Ex: 'Silva' ou '500123456' — deixa vazio para ver todos",
+    ).strip()
+
 todos_clientes = clean_clientes_df(st.session_state.clientes)
 coluna_filtro = FILTROS_IMPOSTO[filtro_escolhido]
 if coluna_filtro is None:
@@ -103,8 +117,19 @@ elif coluna_filtro == "__nenhum__":
 else:
     clientes_mostrados = todos_clientes[todos_clientes[coluna_filtro]]
 
+if pesquisa:
+    mascara = (
+        clientes_mostrados["Nome"].str.contains(pesquisa, case=False, na=False)
+        | clientes_mostrados["NIF"].str.contains(pesquisa, na=False)
+    )
+    clientes_mostrados = clientes_mostrados[mascara]
+
 nifs_visiveis_antes = set(clientes_mostrados["NIF"])
 st.caption(f"A mostrar {len(clientes_mostrados)} de {len(todos_clientes)} cliente(s) no total.")
+
+invalidos_atuais = nifs_invalidos(clientes_mostrados)
+if invalidos_atuais:
+    st.warning(f"⚠️ NIFs com dígito de controlo inválido nesta lista (provável erro de digitação): {', '.join(invalidos_atuais)}")
 
 st.markdown("**Tabela de clientes** — pode editar diretamente, adicionar ou apagar linhas.")
 col_config = {
