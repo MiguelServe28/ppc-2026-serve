@@ -13,6 +13,7 @@ import streamlit as st
 from common import (
     PPC_COLS,
     calcular_ppc,
+    editor_template_bilingue,
     enviar_email,
     escolher_conta_email,
     extrair_nif_de_filename,
@@ -253,11 +254,10 @@ with tab_emails:
         n_pag_email = st.selectbox("Qual pagamento?", [1, 2, 3], format_func=lambda x: f"{x}.º Pagamento", key="n_pag_email")
         tpl = st.session_state.templates[n_pag_email]
 
-        with st.expander("✏️ Editar template deste email"):
+        with st.expander("✏️ Editar template deste email (PT e EN)"):
             if sou_admin():
-                tpl["assunto"] = st.text_input("Assunto", value=tpl["assunto"], key=f"assunto_{n_pag_email}")
-                tpl["corpo"] = st.text_area("Corpo", value=tpl["corpo"], height=300, key=f"corpo_{n_pag_email}")
-                st.caption("Placeholders disponíveis: {nome} {nif} {email} {pag1} {pag2} {pag3} {total} {data1} {data2} {data3} {ano_dados} {ano_pagamentos}")
+                editor_template_bilingue(tpl, f"ppc_tpl_{n_pag_email}", altura=300)
+                st.caption("Placeholders disponíveis: {nome} {nif} {email} {pag1} {pag2} {pag3} {total} {data1} {data2} {data3} {ano_dados} {ano_pagamentos}. Cada cliente recebe na língua definida no registo central (coluna 'Língua').")
             else:
                 st.caption("Os templates de email são definidos pelo administrador.")
                 st.text_input("Assunto", value=tpl["assunto"], disabled=True)
