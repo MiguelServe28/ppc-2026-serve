@@ -8,7 +8,18 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from common import APLICA_COLS, TIPO_COLS, calcular_ppc, clean_clientes_df, montar_base_ppc, sou_admin
+from common import (
+    APLICA_COLS,
+    TIPO_COLS,
+    calcular_ppc,
+    carregar_ss_mes_db,
+    clean_clientes_df,
+    data_limite_ss,
+    montar_base_ppc,
+    montar_base_ss,
+    nome_mes,
+    sou_admin,
+)
 
 st.title("📊 Dashboard")
 st.caption("SERVE — Contabilidade e Viabilização Empresarial. Visão global da carteira de clientes.")
@@ -35,6 +46,21 @@ if not df_ppc.empty:
             st.error(f"🚨 O prazo do {n}.º Pagamento por Conta ({data_limite.strftime('%d/%m/%Y')}) já passou há {-dias} dia(s) e ainda há {pendentes} cliente(s) sem email enviado.")
         elif dias <= 45:
             st.warning(f"⏰ O {n}.º Pagamento por Conta vence a {data_limite.strftime('%d/%m/%Y')} (daqui a {dias} dia(s)) — faltam {pendentes} email(s) por enviar. Vai à página PPC → Emails.")
+
+# --- Alerta Segurança Social (mês de referência = mês anterior) --------------
+base_ss = montar_base_ss()
+if not base_ss.empty:
+    hoje = date.today()
+    ano_ref, mes_ref_n = (hoje.year, hoje.month - 1) if hoje.month > 1 else (hoje.year - 1, 12)
+    mes_ref = f"{ano_ref:04d}-{mes_ref_n:02d}"
+    enviados_ss = carregar_ss_mes_db(mes_ref)
+    pendentes_ss = int(sum(not enviados_ss.get(n, False) for n in base_ss["NIF"]))
+    limite_ss = data_limite_ss(mes_ref)
+    dias_ss = (limite_ss - hoje).days
+    if pendentes_ss and 0 <= dias_ss <= 10:
+        st.warning(f"⏰ Segurança Social de {nome_mes(mes_ref)}: pagamento até {limite_ss.strftime('%d/%m/%Y')} (daqui a {dias_ss} dia(s)) — faltam {pendentes_ss} email(s) por enviar. Vai à página Segurança Social.")
+    elif pendentes_ss and -5 <= dias_ss < 0:
+        st.error(f"🚨 Segurança Social de {nome_mes(mes_ref)}: o prazo ({limite_ss.strftime('%d/%m/%Y')}) já passou e ainda há {pendentes_ss} email(s) por enviar.")
 
 c1, c2 = st.columns(2)
 c1.metric("Total de Clientes (registo central)", len(clientes))
