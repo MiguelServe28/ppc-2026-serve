@@ -14,6 +14,8 @@ import streamlit as st
 from common import (
     IRS_COLS,
     clean_clientes_df,
+    clean_irs_df,
+    editor_template_bilingue,
     enviar_email,
     escolher_conta_email,
     extrair_dados_liquidacao_irs,
@@ -59,18 +61,27 @@ with tab_importar:
         "automaticamente, por isso nunca aparecem misturados nas contas de PPC ou de outro imposto — "
         "podes vê-los à parte na página 'Clientes', usando o filtro 'Só IRS'."
     )
-    up_irs_csv = st.file_uploader(
-        "Importar CSV ou Excel (colunas: NIF, Nome, Email, Gestor_Nome, Gestor_Email)",
-        type=["csv", "xlsx"],
-        key="up_irs_clientes_csv",
-    )
+    col_up, col_tpl = st.columns([2, 1])
+    with col_tpl:
+        template_irs_csv = pd.DataFrame(
+            [{"N.º": "123", "NIF": "123456789", "Nome": "Cliente Exemplo", "Email": "cliente@exemplo.pt", "Lingua": "PT"}]
+        ).to_csv(index=False, sep=";")
+        st.download_button("📥 Template CSV (IRS)", template_irs_csv, file_name="template_clientes_irs.csv", mime="text/csv")
+        st.caption("Colunas: N.º, NIF, Nome, Email, Lingua (PT ou EN). Estes clientes ficam marcados como 'Só IRS (avulso)'.")
+    with col_up:
+        up_irs_csv = st.file_uploader(
+            "Importar CSV ou Excel (colunas: N.º, NIF, Nome, Email)",
+            type=["csv", "xlsx"],
+            key="up_irs_clientes_csv",
+        )
     if up_irs_csv is not None:
         try:
             bruto_irs = ler_ficheiro_importacao(up_irs_csv)
             novos_irs = clean_clientes_df(bruto_irs)
             novos_irs["Aplica_IRS"] = True
+            novos_irs["IRS_Avulso"] = True  # marca-os como "só IRS" — não são clientes de avença
             st.markdown(f"**{len(novos_irs)} cliente(s) lidos do ficheiro:**")
-            st.dataframe(novos_irs[["NIF", "Nome", "Email", "Gestor_Nome", "Gestor_Email"]], use_container_width=True, hide_index=True)
+            st.dataframe(novos_irs[["Numero_Cliente", "NIF", "Nome", "Email"]].rename(columns={"Numero_Cliente": "N.º"}), use_container_width=True, hide_index=True)
             from common import nifs_invalidos
             invalidos = nifs_invalidos(novos_irs)
             if invalidos:
@@ -92,21 +103,48 @@ if base_irs.empty:
 # --- Visão Geral -----------------------------------------------------------
 with tab_visao:
     st.subheader("Estado por Cliente")
-    show_cols = ["NIF", "Nome", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado"]
-    st.dataframe(
-        base_irs[show_cols].rename(columns={
-            "Numero_Liquidacao": "Nº Liquidação", "Valor_Apurado": "Valor Apurado (€)",
-            "Valor_Pendente": "Pendente (€)", "Incluido_Avenca": "Incluído na Avença", "Email_Enviado": "Email Enviado",
-        }),
+
+    FILTRO_TIPO_IRS = {
+        "Todos": None,
+        "Clientes de avença (base central, com pisco IRS)": False,
+        "Só IRS (importados à parte no menu IRS)": True,
+    }
+    filtro_tipo = st.selectbox("Mostrar", list(FILTRO_TIPO_IRS.keys()), key="filtro_tipo_irs")
+    alvo = FILTRO_TIPO_IRS[filtro_tipo]
+    mostrados = base_irs if alvo is None else base_irs[base_irs["IRS_Avulso"] == alvo]
+    st.caption(f"A mostrar {len(mostrados)} de {len(base_irs)} cliente(s) de IRS.")
+
+    show_cols = ["Numero_Cliente", "NIF", "Nome", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado"]
+    st.caption("✏️ Podes marcar/desmarcar diretamente os piscos 'Incluído na Avença' e 'Email Enviado' — carrega em Guardar no fim.")
+    editado = st.data_editor(
+        mostrados[show_cols],
         use_container_width=True,
         hide_index=True,
         height=400,
+        disabled=["Numero_Cliente", "NIF", "Nome", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente"],
+        column_config={
+            "Numero_Cliente": st.column_config.TextColumn("N.º"),
+            "Numero_Liquidacao": st.column_config.TextColumn("Nº Liquidação"),
+            "Valor_Apurado": st.column_config.NumberColumn("Valor Apurado (€)", format="%.2f"),
+            "Valor_Pendente": st.column_config.NumberColumn("Pendente (€)", format="%.2f"),
+            "Incluido_Avenca": st.column_config.CheckboxColumn("Incluído na Avença"),
+            "Email_Enviado": st.column_config.CheckboxColumn("Email Enviado"),
+        },
+        key=f"editor_visao_irs_{filtro_tipo}",
     )
+    if st.button("💾 Guardar piscos"):
+        novo = clean_irs_df(editado[["NIF", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado"]])
+        atual = clean_irs_df(pd.DataFrame(st.session_state.irs_dados))
+        resto = atual[~atual["NIF"].isin(set(novo["NIF"]))]
+        persistir_irs(pd.concat([resto, novo], ignore_index=True)[IRS_COLS])
+        st.success("Piscos guardados.")
+        st.rerun()
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total de Clientes IRS", len(base_irs))
-    c2.metric("A Pagar", int((base_irs["Valor_Apurado"] > 0).sum()))
-    c3.metric("A Receber (reembolso)", int((base_irs["Valor_Apurado"] < 0).sum()))
-    c4.metric("Emails Enviados", f"{int(base_irs['Email_Enviado'].sum())} / {len(base_irs)}")
+    c1.metric("Clientes IRS (no filtro)", len(mostrados))
+    c2.metric("A Pagar", int((mostrados["Valor_Apurado"] > 0).sum()))
+    c3.metric("A Receber (reembolso)", int((mostrados["Valor_Apurado"] < 0).sum()))
+    c4.metric("Emails Enviados", f"{int(mostrados['Email_Enviado'].sum())} / {len(mostrados)}")
 
     st.divider()
     excel_irs = gerar_excel_irs(base_irs, st.session_state.params)
@@ -328,12 +366,11 @@ with tab_template:
     st.subheader("Template do Email de Liquidação de IRS")
     tpl = st.session_state.template_irs
     if sou_admin():
-        tpl["assunto"] = st.text_input("Assunto", value=tpl["assunto"], key="irs_tpl_assunto")
-        tpl["corpo"] = st.text_area("Corpo", value=tpl["corpo"], height=320, key="irs_tpl_corpo")
+        editor_template_bilingue(tpl, "irs_tpl", altura=320)
         st.caption(
             "Placeholders disponíveis: {nome} {nif} {email} {ref_liquidacao} {frase_valor} {frase_pendente} {ano_dados} {ano_pagamentos}. "
             "{ref_liquidacao} já vem formatado como ', n.º de liquidação XXXX' (ou vazio, se não houver). "
-            "{frase_valor} e {frase_pendente} são frases já prontas, geradas automaticamente a partir dos valores — não precisas de os escrever à mão."
+            "{frase_valor} e {frase_pendente} são frases já prontas, geradas automaticamente a partir dos valores e na língua do cliente — não precisas de os escrever à mão."
         )
     else:
         st.caption("O template de email é definido pelo administrador.")
