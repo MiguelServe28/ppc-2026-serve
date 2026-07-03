@@ -45,7 +45,8 @@ paginas = {
     "Impostos": [
         st.Page("paginas/ppc.py", title="PPC", icon="💶"),
         st.Page("paginas/irs.py", title="IRS", icon="🧾"),
-        # Próximos módulos, cada um na sua página: IVA, IMI, Segurança Social (DMR/DRI).
+        st.Page("paginas/ss.py", title="Segurança Social", icon="🏛️"),
+        # Próximos módulos, cada um na sua página: IVA, IMI.
     ],
 }
 
