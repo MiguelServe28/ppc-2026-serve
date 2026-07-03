@@ -665,29 +665,98 @@ def extrair_nif_de_filename(filename: str):
 
 
 # ---------------------------------------------------------------------------
-# Configuração SMTP partilhada (evita ter de reintroduzir as credenciais em
-# cada página que envia email, dentro da mesma sessão)
+# Contas de email (SMTP) nomeadas e persistentes — cada gestor pode ter as suas
+# próprias contas privadas, e o admin pode criar contas partilhadas (ex: "IRS
+# Geral", "Segurança Social") que ficam visíveis para toda a equipa. Isto
+# substitui ter de escrever utilizador/password de cada vez que se envia email.
 # ---------------------------------------------------------------------------
-def smtp_config_form() -> dict:
-    if "smtp_cfg" not in st.session_state:
-        st.session_state.smtp_cfg = {
-            "host": "smtp.office365.com", "porta": 587, "tls": True,
-            "utilizador": "", "password": "", "remetente": "",
+def carregar_contas_email() -> list:
+    client = get_client()
+    resp = client.table("smtp_contas").select("*").order("nome").execute()
+    return resp.data or []
+
+
+def criar_conta_email(nome: str, host: str, porta: int, tls: bool, utilizador: str, password: str, remetente: str, partilhada: bool):
+    client = get_client()
+    client.table("smtp_contas").insert({
+        "nome": nome, "host": host, "porta": porta, "tls": tls,
+        "utilizador": utilizador, "password": password, "remetente": remetente or utilizador,
+        "proprietario_id": st.session_state.user.id, "partilhada": partilhada,
+    }).execute()
+
+
+def apagar_conta_email(conta_id: int):
+    client = get_client()
+    client.table("smtp_contas").delete().eq("id", conta_id).execute()
+
+
+def escolher_conta_email(contexto: str) -> dict:
+    """Widget reutilizável: escolher de entre as contas de email já guardadas
+    (privadas + partilhadas), com atalho para criar uma nova ou apagar as tuas.
+    'contexto' é só uma etiqueta (ex: 'ppc', 'irs') para lembrar a última
+    escolhida em cada página, separadamente."""
+    contas = carregar_contas_email()
+    st.markdown("### Conta de Email")
+
+    smtp_cfg = {"host": "", "porta": 587, "tls": True, "utilizador": "", "password": "", "remetente": ""}
+    if contas:
+        opcoes = {
+            f"{c['nome']}" + (" 🌐 partilhada" if c["partilhada"] else " 🔒 privada"): c
+            for c in contas
         }
-    cfg = st.session_state.smtp_cfg
-    st.markdown("### Configuração SMTP")
-    c1, c2 = st.columns(2)
-    with c1:
-        cfg["host"] = st.text_input("Servidor SMTP", value=cfg["host"], key="smtp_host")
-        cfg["utilizador"] = st.text_input("Utilizador (email de login)", value=cfg["utilizador"], key="smtp_user")
-        cfg["remetente"] = st.text_input("Remetente (From)", value=cfg["utilizador"] or cfg["remetente"], key="smtp_from")
-    with c2:
-        cfg["porta"] = st.number_input("Porta", value=int(cfg["porta"]), step=1, key="smtp_port")
-        cfg["tls"] = st.checkbox("Usar STARTTLS (recomendado, porta 587)", value=cfg["tls"], key="smtp_tls")
-        cfg["password"] = st.text_input("Password / App Password", value=cfg["password"], type="password", key="smtp_pass")
-    st.caption("Gmail: smtp.gmail.com, porta 587, TLS — requer 'App Password'. Office365/Outlook: smtp.office365.com, porta 587, TLS. A password não é guardada na base de dados — fica só nesta sessão do browser.")
-    return {"host": cfg["host"], "porta": int(cfg["porta"]), "tls": cfg["tls"],
-            "utilizador": cfg["utilizador"], "password": cfg["password"], "remetente": cfg["remetente"]}
+        rotulos = list(opcoes.keys())
+        chave_escolha = f"conta_email_escolhida_{contexto}"
+        indice_default = rotulos.index(st.session_state[chave_escolha]) if st.session_state.get(chave_escolha) in rotulos else 0
+        escolhida_label = st.selectbox("Enviar a partir de", rotulos, index=indice_default, key=f"select_{chave_escolha}")
+        st.session_state[chave_escolha] = escolhida_label
+        conta = opcoes[escolhida_label]
+        smtp_cfg = {
+            "host": conta["host"], "porta": int(conta["porta"]), "tls": conta["tls"],
+            "utilizador": conta["utilizador"], "password": conta["password"],
+            "remetente": conta["remetente"] or conta["utilizador"],
+        }
+    else:
+        st.info("Ainda não tens nenhuma conta de email guardada — cria uma abaixo.")
+
+    with st.expander("➕ Adicionar / gerir contas de email"):
+        with st.form(f"nova_conta_email_{contexto}", clear_on_submit=True):
+            nome = st.text_input("Nome da conta (ex: 'IRS Geral', 'Miguel — pessoal')")
+            host = st.text_input("Servidor SMTP", value="smtp.office365.com")
+            c1, c2 = st.columns(2)
+            with c1:
+                utilizador = st.text_input("Utilizador (email de login)")
+                porta = st.number_input("Porta", value=587, step=1)
+            with c2:
+                remetente = st.text_input("Remetente (From, opcional — usa o utilizador se vazio)")
+                tls = st.checkbox("Usar STARTTLS (porta 587)", value=True)
+            password = st.text_input("Password / App Password", type="password")
+            partilhada = False
+            if sou_admin():
+                partilhada = st.checkbox("Tornar visível para toda a equipa (conta partilhada)")
+            st.caption("Gmail: smtp.gmail.com, porta 587. Office365/Outlook: smtp.office365.com, porta 587. Usa sempre uma 'App Password', nunca a password principal da conta.")
+            if st.form_submit_button("💾 Guardar conta"):
+                if nome and utilizador and password:
+                    criar_conta_email(nome, host, int(porta), tls, utilizador, password, remetente, partilhada)
+                    st.success(f"Conta '{nome}' guardada.")
+                    st.rerun()
+                else:
+                    st.error("Preenche pelo menos nome, utilizador e password.")
+
+        if contas:
+            st.divider()
+            st.caption("Contas existentes:")
+            for c in contas:
+                pode_apagar = c["proprietario_id"] == st.session_state.user.id or sou_admin()
+                col_a, col_b = st.columns([5, 1])
+                with col_a:
+                    marca = "🌐 partilhada" if c["partilhada"] else "🔒 privada"
+                    st.write(f"**{c['nome']}** — {c['utilizador']} ({marca})")
+                with col_b:
+                    if pode_apagar and st.button("🗑️ Apagar", key=f"apagar_conta_{c['id']}_{contexto}"):
+                        apagar_conta_email(c["id"])
+                        st.rerun()
+
+    return smtp_cfg
 
 
 # ---------------------------------------------------------------------------
