@@ -14,6 +14,7 @@ from common import (
     IRS_COLS,
     clean_clientes_df,
     enviar_email,
+    escolher_conta_email,
     extrair_dados_liquidacao_irs,
     extrair_dados_pendentes_irs,
     guardar_config_db,
@@ -23,7 +24,6 @@ from common import (
     persistir_irs,
     registar_log,
     render_template_irs,
-    smtp_config_form,
     sou_admin,
 )
 
@@ -245,11 +245,11 @@ with tab_processar:
         st.warning("Este cliente não tem email preenchido no registo central — não é possível enviar.")
 
     st.divider()
-    smtp_cfg = smtp_config_form()
+    smtp_cfg = escolher_conta_email("irs")
 
     if st.button("🚀 Enviar Email", type="primary", disabled=not row_atual["Email"]):
         if not smtp_cfg["utilizador"] or not smtp_cfg["password"]:
-            st.error("Preencher utilizador e password SMTP.")
+            st.error("Escolhe ou cria uma conta de email com utilizador e password preenchidos.")
         else:
             try:
                 cc_gestor = [row_atual["Gestor_Email"]] if row_atual["Gestor_Email"] else []
