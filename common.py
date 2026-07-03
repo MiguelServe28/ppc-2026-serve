@@ -20,6 +20,7 @@ from email.mime.text import MIMEText
 import pandas as pd
 import pdfplumber
 import streamlit as st
+from cryptography.fernet import Fernet, InvalidToken
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -54,15 +55,15 @@ COLUMN_MAP_FROM_DB = {v: k for k, v in COLUMN_MAP_TO_DB.items()}
 # Dados específicos do PPC (tabela própria, ligada por NIF)
 # ---------------------------------------------------------------------------
 PPC_COLS = [
-    "NIF", "Volume_2025", "Coleta_2025", "Retencoes_2025",
+    "NIF", "Volume", "Coleta", "Retencoes",
     "Guia1_Emitida", "Guia2_Emitida", "Guia3_Emitida",
     "Email1_Enviado", "Email2_Enviado", "Email3_Enviado",
 ]
 PPC_BOOL_COLS = [c for c in PPC_COLS if c.startswith("Guia") or c.startswith("Email")]
-PPC_NUM_COLS = ["Volume_2025", "Coleta_2025", "Retencoes_2025"]
+PPC_NUM_COLS = ["Volume", "Coleta", "Retencoes"]
 
 PPC_COLUMN_MAP_TO_DB = {
-    "NIF": "nif", "Volume_2025": "volume_2025", "Coleta_2025": "coleta_2025", "Retencoes_2025": "retencoes_2025",
+    "NIF": "nif", "Volume": "volume", "Coleta": "coleta", "Retencoes": "retencoes",
     "Guia1_Emitida": "guia1_emitida", "Guia2_Emitida": "guia2_emitida", "Guia3_Emitida": "guia3_emitida",
     "Email1_Enviado": "email1_enviado", "Email2_Enviado": "email2_enviado", "Email3_Enviado": "email3_enviado",
 }
@@ -70,11 +71,11 @@ PPC_COLUMN_MAP_FROM_DB = {v: k for k, v in PPC_COLUMN_MAP_TO_DB.items()}
 
 DEFAULT_TEMPLATES = {
     1: {
-        "assunto": "Pagamentos por Conta 2026 — {nome}",
+        "assunto": "Pagamentos por Conta {ano_pagamentos} — {nome}",
         "corpo": (
             "Exmo(a). Sr(a).,\n\n"
-            "No seguimento do apuramento do IRC referente a 2025, informamos que a {nome} "
-            "(NIF {nif}) tem pagamentos por conta a efetuar em 2026, nos seguintes montantes e prazos:\n\n"
+            "No seguimento do apuramento do IRC referente a {ano_dados}, informamos que a {nome} "
+            "(NIF {nif}) tem pagamentos por conta a efetuar em {ano_pagamentos}, nos seguintes montantes e prazos:\n\n"
             "• 1.º Pagamento por Conta: {pag1} € — até {data1}\n"
             "• 2.º Pagamento por Conta: {pag2} € — até {data2}\n"
             "• 3.º Pagamento por Conta: {pag3} € — até {data3}\n\n"
@@ -87,7 +88,7 @@ DEFAULT_TEMPLATES = {
         ),
     },
     2: {
-        "assunto": "2.º Pagamento por Conta 2026 — {nome}",
+        "assunto": "2.º Pagamento por Conta {ano_pagamentos} — {nome}",
         "corpo": (
             "Exmo(a). Sr(a).,\n\n"
             "No seguimento do 1.º pagamento por conta já efetuado, relembramos que o 2.º pagamento por conta "
@@ -98,7 +99,7 @@ DEFAULT_TEMPLATES = {
         ),
     },
     3: {
-        "assunto": "3.º Pagamento por Conta 2026 — {nome}",
+        "assunto": "3.º Pagamento por Conta {ano_pagamentos} — {nome}",
         "corpo": (
             "Exmo(a). Sr(a).,\n\n"
             "No seguimento dos pagamentos por conta já efetuados, relembramos que o 3.º e último pagamento por "
@@ -190,7 +191,8 @@ def sidebar_utilizador():
                 get_client().auth.sign_out()
             except Exception:
                 pass
-            for k in ("user", "perfil", "sb_client", "clientes", "ppc_dados", "params", "templates", "log_envio"):
+            for k in ("user", "perfil", "sb_client", "clientes", "ppc_dados", "irs_dados",
+                      "params", "templates", "template_irs", "log_envio", "guias_por_associar"):
                 st.session_state.pop(k, None)
             st.rerun()
         st.divider()
@@ -247,10 +249,12 @@ def perfil_nome_vazio() -> bool:
     return not (st.session_state.perfil.get("nome") or "").strip()
 
 
-def guardar_clientes_db(df: pd.DataFrame):
-    """Substitui os clientes visíveis por este utilizador pelo conteúdo de df.
-    Um gestor só vê/apaga/insere os seus próprios clientes (RLS trata do âmbito);
-    o admin substitui a lista completa."""
+def guardar_clientes_db(df: pd.DataFrame, nifs_antes: set = None):
+    """Grava por DIFERENÇA (nunca 'apaga tudo primeiro'): faz upsert das linhas
+    de df e apaga apenas os NIFs que existiam antes e desapareceram. Assim, se a
+    ligação falhar a meio, o pior que acontece é a gravação ficar incompleta —
+    nunca se perde a carteira inteira. Um gestor só toca nos seus próprios
+    clientes (RLS trata do âmbito)."""
     client = get_client()
     df2 = clean_clientes_df(df).copy()
 
@@ -259,22 +263,29 @@ def guardar_clientes_db(df: pd.DataFrame):
         if not perfil_nome_vazio():
             df2["Gestor_Nome"] = st.session_state.perfil["nome"]
 
-    client.table("clientes").delete().neq("nif", "").execute()
+    if nifs_antes is None:
+        antes = clean_clientes_df(st.session_state.get("clientes", pd.DataFrame(columns=CLIENT_COLS)))
+        nifs_antes = set(antes["NIF"])
+    para_apagar = nifs_antes - set(df2["NIF"])
+    if para_apagar:
+        client.table("clientes").delete().in_("nif", list(para_apagar)).execute()
     if not df2.empty:
         registos = df2.rename(columns=COLUMN_MAP_TO_DB).to_dict("records")
         client.table("clientes").upsert(registos, on_conflict="nif").execute()
 
 
 def persistir_clientes(df: pd.DataFrame):
-    """Atualiza a sessão E grava imediatamente no Supabase. Usa-se quando 'df' é
-    o conjunto COMPLETO de clientes pretendido (ex: importação) — substitui tudo."""
+    """Grava no Supabase E atualiza a sessão. Usa-se quando 'df' é o conjunto
+    COMPLETO de clientes pretendido (ex: importação) — substitui tudo, mas de
+    forma segura (por diferença)."""
     df = clean_clientes_df(df)
     if not sou_admin():
         df["Gestor_Email"] = meu_email()
         if not perfil_nome_vazio():
             df["Gestor_Nome"] = st.session_state.perfil["nome"]
+    antes = clean_clientes_df(st.session_state.get("clientes", pd.DataFrame(columns=CLIENT_COLS)))
+    guardar_clientes_db(df, nifs_antes=set(antes["NIF"]))
     st.session_state.clientes = df
-    guardar_clientes_db(df)
 
 
 def guardar_clientes_parcial_db(df_editado: pd.DataFrame, nifs_visiveis_antes: set) -> pd.DataFrame:
@@ -321,10 +332,17 @@ def carregar_ppc_db() -> pd.DataFrame:
     return clean_ppc_df(df)
 
 
-def guardar_ppc_db(df: pd.DataFrame):
+def guardar_ppc_db(df: pd.DataFrame, nifs_antes: set = None):
+    """Grava por diferença (upsert + apagar só os que desapareceram) — ver nota
+    em guardar_clientes_db."""
     client = get_client()
     df2 = clean_ppc_df(df).copy()
-    client.table("ppc_dados").delete().neq("nif", "").execute()
+    if nifs_antes is None:
+        antes = clean_ppc_df(st.session_state.get("ppc_dados", pd.DataFrame(columns=PPC_COLS)))
+        nifs_antes = set(antes["NIF"])
+    para_apagar = nifs_antes - set(df2["NIF"])
+    if para_apagar:
+        client.table("ppc_dados").delete().in_("nif", list(para_apagar)).execute()
     if not df2.empty:
         registos = df2.rename(columns=PPC_COLUMN_MAP_TO_DB).to_dict("records")
         client.table("ppc_dados").upsert(registos, on_conflict="nif").execute()
@@ -332,8 +350,8 @@ def guardar_ppc_db(df: pd.DataFrame):
 
 def persistir_ppc(df: pd.DataFrame):
     df = clean_ppc_df(df)
-    st.session_state.ppc_dados = df
     guardar_ppc_db(df)
+    st.session_state.ppc_dados = df
 
 
 def montar_base_ppc() -> pd.DataFrame:
@@ -355,7 +373,7 @@ def montar_base_ppc() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def carregar_log_db() -> list:
     client = get_client()
-    resp = client.table("log_envios").select("data, nif, nome, pagamento, estado").order("id").execute()
+    resp = client.table("log_envios").select("data, nif, nome, pagamento, estado, modulo, enviado_por").order("id").execute()
     return resp.data or []
 
 
@@ -380,8 +398,11 @@ def carregar_config_db():
     params, templates, template_irs = None, None, None
     if params_json:
         params = {
-            "limiar_volume": params_json["limiar_volume"], "taxa_baixa": params_json["taxa_baixa"],
-            "taxa_alta": params_json["taxa_alta"], "limite_dispensa": params_json["limite_dispensa"],
+            "limiar_volume": params_json.get("limiar_volume", 500000.0), "taxa_baixa": params_json.get("taxa_baixa", 0.80),
+            "taxa_alta": params_json.get("taxa_alta", 0.95), "limite_dispensa": params_json.get("limite_dispensa", 200.0),
+            "ano_dados": int(params_json.get("ano_dados", 2025)),
+            "ano_pagamentos": int(params_json.get("ano_pagamentos", 2026)),
+            "assinatura_html": params_json.get("assinatura_html", ""),
             "data1": date.fromisoformat(params_json["data1"]), "data2": date.fromisoformat(params_json["data2"]),
             "data3": date.fromisoformat(params_json["data3"]),
         }
@@ -419,12 +440,10 @@ def init_state():
         st.session_state.ppc_dados = carregar_ppc_db()
     if "irs_dados" not in st.session_state:
         st.session_state.irs_dados = carregar_irs_db()
-    if "guias" not in st.session_state:
-        st.session_state.guias = {}  # {(nif, n_pagamento): (filename, bytes)} — só dura a sessão atual
-    if "guias_irs" not in st.session_state:
-        st.session_state.guias_irs = {}  # {nif: (filename, bytes)} — guia de pagamento de IRS, só dura a sessão
-    if "faturas_irs" not in st.session_state:
-        st.session_state.faturas_irs = {}  # {nif: (filename, bytes)} — fatura do serviço de IRS, só dura a sessão
+    if "guias_por_associar" not in st.session_state:
+        # PDFs de guias PPC carregados cujo nome não tinha NIF — ficam aqui à
+        # espera de associação manual; depois de associados vão para o Storage.
+        st.session_state.guias_por_associar = {}  # {(n_pag, filename): bytes}
     if "params" not in st.session_state or "templates" not in st.session_state or "template_irs" not in st.session_state:
         params_db, templates_db, template_irs_db = carregar_config_db()
         if "params" not in st.session_state:
@@ -433,6 +452,9 @@ def init_state():
                 "taxa_baixa": 0.80,
                 "taxa_alta": 0.95,
                 "limite_dispensa": 200.0,
+                "ano_dados": 2025,        # ano dos dados (Modelo 22 / liquidações)
+                "ano_pagamentos": 2026,   # ano em que os pagamentos são feitos
+                "assinatura_html": "",    # assinatura acrescentada aos emails (HTML simples)
                 "data1": date(2026, 7, 31),
                 "data2": date(2026, 9, 30),
                 "data3": date(2026, 12, 15),
@@ -489,7 +511,15 @@ def ler_ficheiro_importacao(uploaded_file) -> pd.DataFrame:
         df = pd.read_excel(uploaded_file)
 
     df.columns = [str(c).strip() for c in df.columns]
-    for c in ("Volume_2025", "Coleta_2025", "Retencoes_2025"):
+    # Aceita tanto os nomes novos (Volume, Coleta, Retencoes) como os antigos
+    # com ano (Volume_2025, ...) ou com o ano configurado (Volume_2026, ...).
+    aliases = {}
+    for base in ("Volume", "Coleta", "Retencoes"):
+        for c in df.columns:
+            if c == base or re.fullmatch(rf"{base}_\d{{4}}", c):
+                aliases[c] = base
+    df = df.rename(columns=aliases)
+    for c in ("Volume", "Coleta", "Retencoes"):
         if c in df.columns:
             df[c] = parse_numero_pt(df[c])
     if "Email" in df.columns:
@@ -505,8 +535,8 @@ def ler_ficheiro_importacao(uploaded_file) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def calcular_ppc(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     df = df.copy()
-    df["Base_Calculo"] = (df["Coleta_2025"] - df["Retencoes_2025"]).clip(lower=0)
-    df["Taxa"] = df["Volume_2025"].apply(
+    df["Base_Calculo"] = (df["Coleta"] - df["Retencoes"]).clip(lower=0)
+    df["Taxa"] = df["Volume"].apply(
         lambda v: params["taxa_baixa"] if v <= params["limiar_volume"] else params["taxa_alta"]
     )
     df["Dispensado"] = df["Base_Calculo"] < params["limite_dispensa"]
@@ -528,9 +558,11 @@ def calcular_ppc(df: pd.DataFrame, params: dict) -> pd.DataFrame:
 # Export Excel (folha de controlo do PPC)
 # ---------------------------------------------------------------------------
 def gerar_excel_ppc(df_calc: pd.DataFrame, params: dict) -> bytes:
+    ano_dados = params.get("ano_dados", 2025)
+    ano_pag = params.get("ano_pagamentos", 2026)
     wb = Workbook()
     ws = wb.active
-    ws.title = "Controlo PPC 2026"
+    ws.title = f"Controlo PPC {ano_pag}"
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A5"
 
@@ -543,12 +575,12 @@ def gerar_excel_ppc(df_calc: pd.DataFrame, params: dict) -> bytes:
     thin = Side(style="thin", color="BFBFBF")
     BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    ws["A1"] = "Controlo de Pagamentos por Conta — 2026"
+    ws["A1"] = f"Controlo de Pagamentos por Conta — {ano_pag}"
     ws["A1"].font = TITLE_FONT
     ws.merge_cells("A1:D1")
 
     headers = [
-        "NIF", "Nome", "Email", "Gestor (nome)", "Gestor (email)", "Volume 2025", "Coleta 2025", "Retenções 2025",
+        "NIF", "Nome", "Email", "Gestor (nome)", "Gestor (email)", f"Volume {ano_dados}", f"Coleta {ano_dados}", f"Retenções {ano_dados}",
         "Base de Cálculo", "Taxa", "Total PPC", "Dispensado",
         "1º Pagamento", "2º Pagamento", "3º Pagamento",
         "Data Limite 1º", "Data Limite 2º", "Data Limite 3º",
@@ -571,7 +603,7 @@ def gerar_excel_ppc(df_calc: pd.DataFrame, params: dict) -> bytes:
     for _, r in df_calc.iterrows():
         vals = [
             r["NIF"], r["Nome"], r["Email"], r["Gestor_Nome"], r["Gestor_Email"],
-            r["Volume_2025"], r["Coleta_2025"], r["Retencoes_2025"],
+            r["Volume"], r["Coleta"], r["Retencoes"],
             r["Base_Calculo"], r["Taxa"], r["Total_PPC"], "Sim" if r["Dispensado"] else "Não",
             r["Pag1"], r["Pag2"], r["Pag3"],
             params["data1"] if not r["Dispensado"] else None,
@@ -624,22 +656,40 @@ def render_template(template: dict, row: pd.Series, params: dict) -> tuple[str, 
         "data1": params["data1"].strftime("%d/%m/%Y"),
         "data2": params["data2"].strftime("%d/%m/%Y"),
         "data3": params["data3"].strftime("%d/%m/%Y"),
+        "ano_dados": params.get("ano_dados", 2025),
+        "ano_pagamentos": params.get("ano_pagamentos", 2026),
     }
     assunto = template["assunto"].format(**ctx)
     corpo = template["corpo"].format(**ctx)
     return assunto, corpo
 
 
-def enviar_email(smtp_cfg, destinatario, assunto, corpo, anexos, cc=None):
+def enviar_email(smtp_cfg, destinatario, assunto, corpo, anexos, cc=None, assinatura_html=""):
+    """Envia o email em texto E em HTML (multipart/alternative): quem abre num
+    cliente moderno vê a versão HTML (com a assinatura da SERVE, se definida em
+    Configurações); os restantes veem o texto simples."""
+    import html as html_mod
+
     cc_list = [e.strip() for e in (cc or []) if e and e.strip()]
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("mixed")
     msg["From"] = smtp_cfg["remetente"]
     msg["To"] = destinatario
     if cc_list:
         msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = assunto
-    msg.attach(MIMEText(corpo, "plain", "utf-8"))
+
+    corpo_html = (
+        '<html><body><div style="font-family: Calibri, Arial, sans-serif; font-size: 11pt; color: #1a1a2e;">'
+        + html_mod.escape(corpo).replace("\n", "<br>\n")
+        + ("<br><br>" + assinatura_html if assinatura_html else "")
+        + "</div></body></html>"
+    )
+    alternativa = MIMEMultipart("alternative")
+    alternativa.attach(MIMEText(corpo, "plain", "utf-8"))
+    alternativa.attach(MIMEText(corpo_html, "html", "utf-8"))
+    msg.attach(alternativa)
+
     for filename, filebytes in anexos:
         part = MIMEApplication(filebytes, Name=filename)
         part["Content-Disposition"] = f'attachment; filename="{filename}"'
@@ -664,6 +714,61 @@ def extrair_nif_de_filename(filename: str):
     return m.group(1) if m else None
 
 
+def validar_nif(nif: str) -> bool:
+    """Valida o dígito de controlo de um NIF português (9 dígitos, módulo 11).
+    Serve para apanhar NIFs mal escritos na importação/edição — um NIF inválido
+    aqui é quase de certeza um erro de digitação."""
+    nif = str(nif).strip()
+    if not re.fullmatch(r"\d{9}", nif):
+        return False
+    soma = sum(int(d) * p for d, p in zip(nif[:8], range(9, 1, -1)))
+    resto = soma % 11
+    controlo = 0 if resto < 2 else 11 - resto
+    return int(nif[8]) == controlo
+
+
+def nifs_invalidos(df: pd.DataFrame) -> list:
+    """Devolve a lista de NIFs presentes no df que falham a validação."""
+    if "NIF" not in df.columns:
+        return []
+    return [n for n in df["NIF"].astype(str).str.strip() if n and not validar_nif(n)]
+
+
+# ---------------------------------------------------------------------------
+# Encriptação das passwords SMTP — usa a chave SMTP_ENC_KEY definida nos
+# Secrets. Sem chave configurada, funciona na mesma mas guarda em texto simples
+# (com aviso). Gerar uma chave:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# ---------------------------------------------------------------------------
+def _fernet():
+    chave = st.secrets.get("SMTP_ENC_KEY")
+    if not chave:
+        return None
+    try:
+        return Fernet(chave.encode() if isinstance(chave, str) else chave)
+    except Exception:
+        return None
+
+
+def encriptar_password(password: str) -> str:
+    f = _fernet()
+    return f.encrypt(password.encode()).decode() if f else password
+
+
+def desencriptar_password(guardada: str) -> str:
+    """Desencripta a password guardada. Se não estiver encriptada (contas
+    antigas, ou sem SMTP_ENC_KEY), devolve-a tal como está."""
+    if not guardada:
+        return guardada
+    f = _fernet()
+    if not f:
+        return guardada
+    try:
+        return f.decrypt(guardada.encode()).decode()
+    except (InvalidToken, Exception):
+        return guardada  # legado: estava em texto simples
+
+
 # ---------------------------------------------------------------------------
 # Contas de email (SMTP) nomeadas e persistentes — cada gestor pode ter as suas
 # próprias contas privadas, e o admin pode criar contas partilhadas (ex: "IRS
@@ -680,7 +785,7 @@ def criar_conta_email(nome: str, host: str, porta: int, tls: bool, utilizador: s
     client = get_client()
     client.table("smtp_contas").insert({
         "nome": nome, "host": host, "porta": porta, "tls": tls,
-        "utilizador": utilizador, "password": password, "remetente": remetente or utilizador,
+        "utilizador": utilizador, "password": encriptar_password(password), "remetente": remetente or utilizador,
         "proprietario_id": st.session_state.user.id, "partilhada": partilhada,
     }).execute()
 
@@ -712,9 +817,20 @@ def escolher_conta_email(contexto: str) -> dict:
         conta = opcoes[escolhida_label]
         smtp_cfg = {
             "host": conta["host"], "porta": int(conta["porta"]), "tls": conta["tls"],
-            "utilizador": conta["utilizador"], "password": conta["password"],
+            "utilizador": conta["utilizador"], "password": desencriptar_password(conta["password"]),
             "remetente": conta["remetente"] or conta["utilizador"],
         }
+        if st.button("📨 Enviar email de teste", key=f"teste_conta_{contexto}",
+                     help="Envia um email de teste para a própria conta, para confirmares que está bem configurada antes de a usares em envios em massa."):
+            try:
+                enviar_email(
+                    smtp_cfg, smtp_cfg["remetente"], "Teste — Gestão Fiscal SERVE",
+                    "Este é um email de teste enviado a partir da plataforma Gestão Fiscal SERVE.\n"
+                    "Se o estás a ler, a conta está bem configurada.", [],
+                )
+                st.success(f"Email de teste enviado para {smtp_cfg['remetente']} — confirma a caixa de entrada.")
+            except Exception as e:
+                st.error(f"Falha no teste: {e}")
     else:
         st.info("Ainda não tens nenhuma conta de email guardada — cria uma abaixo.")
 
@@ -734,6 +850,8 @@ def escolher_conta_email(contexto: str) -> dict:
             if sou_admin():
                 partilhada = st.checkbox("Tornar visível para toda a equipa (conta partilhada)")
             st.caption("Gmail: smtp.gmail.com, porta 587. Office365/Outlook: smtp.office365.com, porta 587. Usa sempre uma 'App Password', nunca a password principal da conta.")
+            if not st.secrets.get("SMTP_ENC_KEY"):
+                st.warning("⚠️ Sem SMTP_ENC_KEY configurada nos Secrets, as passwords ficam guardadas sem encriptação. Ver GUIA_SUPABASE.md (atualização v5).")
             if st.form_submit_button("💾 Guardar conta"):
                 if nome and utilizador and password:
                     criar_conta_email(nome, host, int(porta), tls, utilizador, password, remetente, partilhada)
@@ -760,6 +878,49 @@ def escolher_conta_email(contexto: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Supabase Storage — guias e faturas em PDF PERSISTENTES (bucket "guias").
+# Carregas o PDF uma vez e ele fica guardado: já não se perde ao fechar o
+# browser. Estrutura de pastas dentro do bucket:
+#   ppc/<n_pagamento>/<nif>.pdf      — guias de PPC
+#   irs/<nif>/guia.pdf               — guia de pagamento de IRS
+#   irs/<nif>/fatura.pdf             — fatura do serviço de IRS
+# ---------------------------------------------------------------------------
+BUCKET_GUIAS = "guias"
+
+
+def storage_upload_pdf(caminho: str, conteudo: bytes):
+    """Carrega (ou substitui) um PDF no bucket de guias."""
+    client = get_client()
+    client.storage.from_(BUCKET_GUIAS).upload(
+        caminho, conteudo, {"content-type": "application/pdf", "upsert": "true"}
+    )
+
+
+def storage_download_pdf(caminho: str):
+    """Devolve os bytes do PDF, ou None se não existir."""
+    try:
+        return get_client().storage.from_(BUCKET_GUIAS).download(caminho)
+    except Exception:
+        return None
+
+
+def storage_listar(pasta: str) -> set:
+    """Nomes de ficheiro (sem o caminho) existentes numa pasta do bucket."""
+    try:
+        itens = get_client().storage.from_(BUCKET_GUIAS).list(pasta)
+        return {i["name"] for i in (itens or []) if i.get("name")}
+    except Exception:
+        return set()
+
+
+def storage_apagar(caminho: str):
+    try:
+        get_client().storage.from_(BUCKET_GUIAS).remove([caminho])
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # IRS — dados específicos (tabela própria, ligada por NIF) e leitura de PDFs
 # ---------------------------------------------------------------------------
 IRS_COLS = ["NIF", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado"]
@@ -777,7 +938,7 @@ DEFAULT_TEMPLATE_IRS = {
     "assunto": "Liquidação de IRS — {nome}",
     "corpo": (
         "Exmo(a). Sr(a).,\n\n"
-        "Junto enviamos a Demonstração de Liquidação de IRS referente ao ano de 2025 "
+        "Junto enviamos a Demonstração de Liquidação de IRS referente ao ano de {ano_dados} "
         "(NIF {nif}{ref_liquidacao}).\n\n"
         "{frase_valor}\n\n"
         "{frase_pendente}"
@@ -818,10 +979,17 @@ def carregar_irs_db() -> pd.DataFrame:
     return clean_irs_df(df)
 
 
-def guardar_irs_db(df: pd.DataFrame):
+def guardar_irs_db(df: pd.DataFrame, nifs_antes: set = None):
+    """Grava por diferença (upsert + apagar só os que desapareceram) — ver nota
+    em guardar_clientes_db."""
     client = get_client()
     df2 = clean_irs_df(df).copy()
-    client.table("irs_dados").delete().neq("nif", "").execute()
+    if nifs_antes is None:
+        antes = clean_irs_df(st.session_state.get("irs_dados", pd.DataFrame(columns=IRS_COLS)))
+        nifs_antes = set(antes["NIF"])
+    para_apagar = nifs_antes - set(df2["NIF"])
+    if para_apagar:
+        client.table("irs_dados").delete().in_("nif", list(para_apagar)).execute()
     if not df2.empty:
         registos = df2.rename(columns=IRS_COLUMN_MAP_TO_DB).to_dict("records")
         client.table("irs_dados").upsert(registos, on_conflict="nif").execute()
@@ -829,8 +997,8 @@ def guardar_irs_db(df: pd.DataFrame):
 
 def persistir_irs(df: pd.DataFrame):
     df = clean_irs_df(df)
-    st.session_state.irs_dados = df
     guardar_irs_db(df)
+    st.session_state.irs_dados = df
 
 
 def montar_base_irs() -> pd.DataFrame:
@@ -964,6 +1132,7 @@ def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
 
     ref_liquidacao = f", n.º de liquidação {row['Numero_Liquidacao']}" if row.get("Numero_Liquidacao") else ""
 
+    params = st.session_state.get("params", {})
     ctx = {
         "nome": row["Nome"],
         "nif": row["NIF"],
@@ -971,7 +1140,73 @@ def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
         "ref_liquidacao": ref_liquidacao,
         "frase_valor": frase_valor,
         "frase_pendente": frase_pendente,
+        "ano_dados": params.get("ano_dados", 2025),
+        "ano_pagamentos": params.get("ano_pagamentos", 2026),
     }
     assunto = template["assunto"].format(**ctx)
     corpo = template["corpo"].format(**ctx)
     return assunto, corpo
+
+
+def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
+    """Folha de controlo das liquidações de IRS (mesmo estilo do Excel do PPC)."""
+    ano_dados = params.get("ano_dados", 2025)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Controlo IRS {ano_dados}"
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A5"
+
+    FONT = "Arial"
+    HEADER_FILL = PatternFill("solid", start_color="1F4E78", end_color="1F4E78")
+    ENVIADO_FILL = PatternFill("solid", start_color="E2EFDA", end_color="E2EFDA")
+    HEADER_FONT = Font(name=FONT, color="FFFFFF", bold=True, size=10)
+    TITLE_FONT = Font(name=FONT, bold=True, size=14, color="1F4E78")
+    BLACK = Font(name=FONT, color="000000")
+    thin = Side(style="thin", color="BFBFBF")
+    BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws["A1"] = f"Controlo de Liquidações de IRS — {ano_dados}"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:D1")
+
+    headers = [
+        "NIF", "Nome", "Email", "Gestor (nome)", "Gestor (email)",
+        "Nº Liquidação", "Valor Apurado (€)", "Pendente à SERVE (€)",
+        "Incluído na Avença", "Email Enviado", "Notas",
+    ]
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=4, column=i, value=h)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = BORDER
+    ws.row_dimensions[4].height = 30
+
+    widths = [12, 26, 24, 18, 24, 16, 15, 15, 12, 12, 20]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    row = 5
+    for _, r in base_irs.iterrows():
+        vals = [
+            r["NIF"], r["Nome"], r["Email"], r["Gestor_Nome"], r["Gestor_Email"],
+            r["Numero_Liquidacao"], r["Valor_Apurado"], r["Valor_Pendente"],
+            "Sim" if r["Incluido_Avenca"] else "Não",
+            "Sim" if r["Email_Enviado"] else "Não",
+            r.get("Notas", ""),
+        ]
+        for i, v in enumerate(vals, start=1):
+            c = ws.cell(row=row, column=i, value=v)
+            c.font = BLACK
+            c.border = BORDER
+            if i in (7, 8):
+                c.number_format = "#,##0.00"
+        if r["Email_Enviado"]:
+            for i in range(1, len(vals) + 1):
+                ws.cell(row=row, column=i).fill = ENVIADO_FILL
+        row += 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
