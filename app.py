@@ -41,12 +41,14 @@ paginas = {
     "Plataforma": [
         st.Page("paginas/dashboard.py", title="Dashboard", icon="📊", default=True),
         st.Page("paginas/clientes.py", title="Clientes", icon="📋"),
+        st.Page("paginas/perfil.py", title="O Meu Perfil", icon="👤"),
     ],
     "Impostos": [
         st.Page("paginas/ppc.py", title="PPC", icon="💶"),
-        st.Page("paginas/irs.py", title="IRS", icon="🧾"),
+        st.Page("paginas/iva.py", title="IVA", icon="🧾"),
+        st.Page("paginas/irs.py", title="IRS", icon="🗂️"),
+        st.Page("paginas/imi.py", title="IMI", icon="🏠"),
         st.Page("paginas/ss.py", title="Segurança Social", icon="🏛️"),
-        # Próximos módulos, cada um na sua página: IVA, IMI.
     ],
 }
 
