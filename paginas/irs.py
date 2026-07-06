@@ -30,7 +30,6 @@ from common import (
     persistir_irs,
     registar_log,
     render_template_irs,
-    sou_admin,
     storage_download_pdf,
     storage_listar,
     storage_upload_pdf,
@@ -367,17 +366,13 @@ with tab_processar:
 with tab_template:
     st.subheader("Template do Email de Liquidação de IRS")
     tpl = st.session_state.template_irs
-    if sou_admin():
-        editor_template_bilingue(tpl, "irs_tpl", altura=320)
-        st.caption(
-            "Placeholders disponíveis: {nome} {nif} {email} {ref_liquidacao} {frase_valor} {frase_pendente} {ano_dados} {ano_pagamentos}. "
-            "{ref_liquidacao} já vem formatado como ', n.º de liquidação XXXX' (ou vazio, se não houver). "
-            "{frase_valor} e {frase_pendente} são frases já prontas, geradas automaticamente a partir dos valores e na língua do cliente — não precisas de os escrever à mão."
-        )
-    else:
-        st.caption("O template de email é definido pelo administrador.")
-        st.text_input("Assunto", value=tpl["assunto"], disabled=True)
-        st.text_area("Corpo", value=tpl["corpo"], height=320, disabled=True)
+    editor_template_bilingue(tpl, "irs_tpl", altura=320)
+    st.caption(
+        "Placeholders disponíveis: {nome} {nif} {email} {ref_liquidacao} {frase_valor} {frase_pendente} {ano_dados} {ano_pagamentos}. "
+        "{ref_liquidacao} já vem formatado como ', n.º de liquidação XXXX' (ou vazio, se não houver). "
+        "{frase_valor} e {frase_pendente} são frases já prontas, geradas automaticamente a partir dos valores e na língua do cliente — não precisas de os escrever à mão. "
+        "Alterações aqui ficam guardadas para toda a equipa."
+    )
 
-# Persistir template caso o admin o tenha editado (RLS bloqueia gestores).
+# Persistir template (guardado para toda a equipa, qualquer utilizador pode editar).
 guardar_config_db(st.session_state.params, st.session_state.templates, st.session_state.template_irs)
