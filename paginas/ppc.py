@@ -116,13 +116,12 @@ with tab_dados:
     if base_ppc.empty:
         st.info("Ainda não há clientes com 'Aplica PPC' ligado. Ativa esse interruptor na página 'Clientes'.")
     else:
-        st.caption(f"Preenche aqui o Volume de Negócios, Coleta IRC e Retenções de {ano_dados} dos clientes elegíveis para PPC. Os estados de guia/email são geridos nas abas 'Guias' e 'Emails'.")
+        st.caption(f"Preenche aqui o Volume de Negócios, Coleta IRC e Retenções de {ano_dados} dos clientes elegíveis para PPC. Os piscos de Guia Emitida / Email Enviado são marcados automaticamente pelas abas 'Guias' e 'Emails', mas também os podes marcar/desmarcar aqui à mão.")
         editor_ppc = st.data_editor(
             base_ppc[["NIF", "Nome"] + [c for c in PPC_COLS if c != "NIF"]],
             use_container_width=True,
             hide_index=True,
-            disabled=["NIF", "Nome", "Guia1_Emitida", "Guia2_Emitida", "Guia3_Emitida",
-                      "Email1_Enviado", "Email2_Enviado", "Email3_Enviado"],
+            disabled=["NIF", "Nome"],
             column_config={
                 "Volume": st.column_config.NumberColumn(f"Volume Negócios {ano_dados} (campo 411)", format="%.2f"),
                 "Coleta": st.column_config.NumberColumn(f"Coleta IRC {ano_dados} (campo 351)", format="%.2f"),
