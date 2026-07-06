@@ -29,7 +29,7 @@ st.caption(
     "este cliente aparece — um cliente pode ter vários ligados ao mesmo tempo."
 )
 if not sou_admin():
-    st.caption(f"Estás a ver apenas os clientes atribuídos a ti ({meu_email()}).")
+    st.caption(f"Vês o registo completo de toda a equipa. Os teus clientes ({meu_email()}) são os que apareces como Gestor.")
 
 col1, col2 = st.columns([2, 1])
 with col1:
