@@ -166,7 +166,9 @@ with tab_processar:
         key="irs_cliente_escolhido",
     )
     row_atual = base_irs[base_irs["NIF"] == nif_escolhido].iloc[0]
-    ficheiros_arquivo = storage_listar(f"irs/{nif_escolhido}")
+    # Os documentos ficam arquivados por ano — mudar o "ano dos dados" nas
+    # Configurações muda também o arquivo consultado.
+    ficheiros_arquivo = storage_listar(f"irs/{ano_dados}/{nif_escolhido}")
 
     st.divider()
     incluido_avenca = st.checkbox(
@@ -185,7 +187,7 @@ with tab_processar:
         if up_guia is not None:
             fid = f"{up_guia.name}_{up_guia.size}"
             if st.session_state.get(f"_guia_irs_proc_{nif_escolhido}") != fid:
-                storage_upload_pdf(f"irs/{nif_escolhido}/guia.pdf", up_guia.getvalue())
+                storage_upload_pdf(f"irs/{ano_dados}/{nif_escolhido}/guia.pdf", up_guia.getvalue())
                 st.session_state[f"_guia_irs_proc_{nif_escolhido}"] = fid
                 ficheiros_arquivo.add("guia.pdf")
         tem_guia = "guia.pdf" in ficheiros_arquivo
@@ -197,7 +199,7 @@ with tab_processar:
             if up_fatura is not None:
                 fid = f"{up_fatura.name}_{up_fatura.size}"
                 if st.session_state.get(f"_fatura_irs_proc_{nif_escolhido}") != fid:
-                    storage_upload_pdf(f"irs/{nif_escolhido}/fatura.pdf", up_fatura.getvalue())
+                    storage_upload_pdf(f"irs/{ano_dados}/{nif_escolhido}/fatura.pdf", up_fatura.getvalue())
                     st.session_state[f"_fatura_irs_proc_{nif_escolhido}"] = fid
                     ficheiros_arquivo.add("fatura.pdf")
             tem_fatura = "fatura.pdf" in ficheiros_arquivo
@@ -321,7 +323,7 @@ with tab_processar:
             try:
                 anexos = []
                 if "guia.pdf" in ficheiros_arquivo:
-                    conteudo = storage_download_pdf(f"irs/{nif_escolhido}/guia.pdf")
+                    conteudo = storage_download_pdf(f"irs/{ano_dados}/{nif_escolhido}/guia.pdf")
                     if conteudo:
                         anexos.append((f"Guia_IRS_{nif_escolhido}.pdf", conteudo))
                 if up_liq is not None:
@@ -329,7 +331,7 @@ with tab_processar:
                 if up_pend is not None:
                     anexos.append((up_pend.name, up_pend.getvalue()))
                 if not incluido_avenca and "fatura.pdf" in ficheiros_arquivo:
-                    conteudo = storage_download_pdf(f"irs/{nif_escolhido}/fatura.pdf")
+                    conteudo = storage_download_pdf(f"irs/{ano_dados}/{nif_escolhido}/fatura.pdf")
                     if conteudo:
                         anexos.append((f"Fatura_{nif_escolhido}.pdf", conteudo))
 
