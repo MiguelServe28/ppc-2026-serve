@@ -837,6 +837,52 @@ def extrair_nif_de_filename(filename: str):
     return m.group(1) if m else None
 
 
+def extrair_label_extra(filename: str, nif: str) -> str:
+    """Para os 'outros documentos' carregados em massa: o nome do ficheiro deve
+    começar pelo NIF, mas o resto pode ser o que quiseres (ex: '267894449_IUC.pdf',
+    '267894449 - Retenções.pdf'). Isto devolve só a parte depois do NIF, para
+    conseguires identificar de que documento se trata (ex: 'IUC.pdf')."""
+    resto = filename.replace(nif, "", 1).strip(" -_")
+    if not resto or resto.lower() in (".pdf", "pdf"):
+        return "Documento.pdf"
+    if not resto.lower().endswith(".pdf"):
+        resto += ".pdf"
+    return resto
+
+
+# Padrões de valor mais comuns em guias/documentos de pagamento portugueses —
+# usados para tentar ler automaticamente o montante de cada documento (DMR,
+# DRI, IUC, etc.) e escrevê-lo no email. É uma leitura best-effort: se não
+# encontrar nada com confiança, simplesmente não aparece essa linha no email
+# (nunca bloqueia o envio nem inventa valores).
+_PADROES_VALOR_DOCUMENTO = (
+    r"Total\s+a\s+pagar[^\d]{0,12}([\d\.,]+)",
+    r"Valor\s+a\s+pagar[^\d]{0,12}([\d\.,]+)",
+    r"Montante\s+a\s+pagar[^\d]{0,12}([\d\.,]+)",
+    r"Total\s+da\s+guia[^\d]{0,12}([\d\.,]+)",
+    r"Total\s+de\s+contribuições[^\d]{0,12}([\d\.,]+)",
+    r"Valor\s+total[^\d]{0,12}([\d\.,]+)",
+    r"Montante\s+total[^\d]{0,12}([\d\.,]+)",
+    r"Total\s*[:\-]\s*([\d\.,]+)",
+)
+
+
+def extrair_valor_documento(conteudo_bytes: bytes):
+    """Tenta ler um valor monetário do texto do PDF (guias de pagamento, DMR,
+    DRI, etc.). Devolve None se não conseguir — nunca bloqueia nada."""
+    try:
+        texto = _extrair_texto_pdf(conteudo_bytes)
+    except Exception:
+        return None
+    for padrao in _PADROES_VALOR_DOCUMENTO:
+        m = re.search(padrao, texto, re.IGNORECASE)
+        if m:
+            v = _parse_valor_pt(m.group(1))
+            if v is not None:
+                return abs(v)
+    return None
+
+
 def validar_nif(nif: str) -> bool:
     """Valida o dígito de controlo de um NIF português (9 dígitos, módulo 11).
     Serve para apanhar NIFs mal escritos na importação/edição — um NIF inválido
@@ -1385,8 +1431,8 @@ def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
 # ---------------------------------------------------------------------------
 # Segurança Social (DMR/DRI) — envio mensal de declarações e guias.
 # Estado "email enviado" guardado por cliente e por mês na tabela ss_dados.
-# Documentos no Storage: ss/<mes>/guia/<nif>.pdf, ss/<mes>/dmr/<nif>.pdf e
-# extras em ss/<mes>/extra/<nif>__<nome do ficheiro>.
+# Documentos no Storage: ss/<mes>/dmr/<nif>.pdf, ss/<mes>/dri/<nif>.pdf e
+# extras em ss/<mes>/extra/<nif>__<nome do ficheiro> (ex: "IUC.pdf").
 # ---------------------------------------------------------------------------
 MESES_PT = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
             "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
@@ -1398,6 +1444,7 @@ DEFAULT_TEMPLATE_SS = {
     "corpo": (
         "Exmo(a). Sr(a).,\n\n"
         "Junto enviamos a documentação da Segurança Social referente a {mes_nome}: {lista_docs}.\n\n"
+        "{lista_valores}\n\n"
         "O pagamento deverá ser efetuado até {data_limite}.\n\n"
         "Ficamos ao dispor para qualquer esclarecimento.\n\n"
         "Com os melhores cumprimentos,"
@@ -1406,6 +1453,7 @@ DEFAULT_TEMPLATE_SS = {
     "corpo_en": (
         "Dear Sir or Madam,\n\n"
         "Please find attached the Social Security documentation for {mes_nome}: {lista_docs}.\n\n"
+        "{lista_valores}\n\n"
         "Payment should be made by {data_limite}.\n\n"
         "We remain at your disposal for any clarification.\n\n"
         "Best regards,"
@@ -1465,18 +1513,40 @@ def montar_base_ss() -> pd.DataFrame:
     return clientes[clientes["Aplica_SS"]].copy()
 
 
-def docs_ss_cliente(mes: str, nif: str, guias_set: set, dmrs_set: set, extras_dict: dict) -> list:
+def obter_documentos_ss(mes: str, nif: str, dmrs_set: set, dris_set: set, extras_dict: dict) -> list:
     """Lista dos documentos disponíveis para um cliente neste mês, a partir dos
-    conjuntos já lidos do Storage (para não fazer chamadas a mais):
-    devolve ex: ["guia", "dmr", "extra:Recibo.pdf"]."""
+    conjuntos já lidos do Storage (para não fazer chamadas a mais). Devolve uma
+    lista de dicts {tipo, caminho, anexo} — 'tipo' é a etiqueta usada no email
+    e no Excel (DMR, DRI, ou o nome do documento extra, ex: IUC)."""
     docs = []
-    if nif in guias_set:
-        docs.append("guia")
     if nif in dmrs_set:
-        docs.append("dmr")
+        docs.append({"tipo": "DMR", "caminho": f"ss/{mes}/dmr/{nif}.pdf", "anexo": f"DMR_{mes}_{nif}.pdf"})
+    if nif in dris_set:
+        docs.append({"tipo": "DRI", "caminho": f"ss/{mes}/dri/{nif}.pdf", "anexo": f"DRI_{mes}_{nif}.pdf"})
     for nome_extra in extras_dict.get(nif, []):
-        docs.append(f"extra:{nome_extra}")
+        docs.append({
+            "tipo": nome_extra.rsplit(".", 1)[0] if "." in nome_extra else nome_extra,
+            "caminho": f"ss/{mes}/extra/{nif}__{nome_extra}",
+            "anexo": nome_extra,
+        })
     return docs
+
+
+def carregar_anexos_e_valores_ss(docs: list) -> tuple[list, list]:
+    """Descarrega cada documento uma única vez e devolve (anexos, valores):
+    'anexos' é [(nome_ficheiro, bytes)] pronto para juntar ao email; 'valores'
+    é [(tipo, valor)] só para os documentos onde foi possível ler um montante
+    automaticamente no PDF (usado para escrever a lista de valores no email)."""
+    anexos, valores = [], []
+    for d in docs:
+        conteudo = storage_download_pdf(d["caminho"])
+        if not conteudo:
+            continue
+        anexos.append((d["anexo"], conteudo))
+        v = extrair_valor_documento(conteudo)
+        if v is not None:
+            valores.append((d["tipo"], v))
+    return anexos, valores
 
 
 def listar_extras_generico(pasta: str) -> dict:
@@ -1495,22 +1565,21 @@ def listar_extras_ss(mes: str) -> dict:
     return listar_extras_generico(f"ss/{mes}/extra")
 
 
-def render_template_ss(template: dict, row: pd.Series, mes: str, docs: list) -> tuple[str, str]:
+def render_template_ss(template: dict, row: pd.Series, mes: str, docs: list, valores: list = None) -> tuple[str, str]:
     """Monta o email da Segurança Social na língua do cliente. 'docs' é a lista
-    devolvida por docs_ss_cliente — usada para escrever a frase dos anexos."""
+    devolvida por obter_documentos_ss (dicts com 'tipo'); 'valores' é a lista
+    opcional devolvida por carregar_anexos_e_valores_ss — [(tipo, valor), ...] —
+    usada para escrever o bloco 'X - valor€' no email quando disponível."""
     lingua = lingua_cliente(row)
-    partes = []
-    for d in docs:
-        if d == "guia":
-            partes.append("payment form" if lingua == "EN" else "guia de pagamento")
-        elif d == "dmr":
-            partes.append("DMR")
-        elif d.startswith("extra:"):
-            partes.append(d.split(":", 1)[1])
-    if partes:
-        lista_docs = ", ".join(partes)
+    tipos = [d["tipo"] for d in docs]
+    lista_docs = ", ".join(tipos) if tipos else ("the attached documents" if lingua == "EN" else "os documentos em anexo")
+
+    if valores:
+        cabecalho = "Amounts due" if lingua == "EN" else "Valores"
+        linhas = "\n".join(f"{tipo} - {formatar_valor(valor)} €" for tipo, valor in valores)
+        bloco_valores = f"{cabecalho}:\n{linhas}"
     else:
-        lista_docs = "the attached documents" if lingua == "EN" else "os documentos em anexo"
+        bloco_valores = ""
 
     ctx = {
         "nome": row["Nome"],
@@ -1519,6 +1588,7 @@ def render_template_ss(template: dict, row: pd.Series, mes: str, docs: list) -> 
         "mes_nome": nome_mes(mes, lingua),
         "data_limite": data_limite_ss(mes).strftime("%d/%m/%Y"),
         "lista_docs": lista_docs,
+        "lista_valores": bloco_valores,
     }
     assunto = texto_template(template, "assunto", lingua).format(**ctx)
     corpo = texto_template(template, "corpo", lingua).format(**ctx)
@@ -1676,7 +1746,7 @@ def render_template_docs(template: dict, row: pd.Series, docs: list, rotulo_prin
 
 def gerar_excel_estado_mensal(titulo: str, base: pd.DataFrame, guias_set: set,
                               decl_set: set, extras_dict: dict, enviados: dict,
-                              rotulo_decl: str = "DMR/DRI") -> bytes:
+                              rotulo_decl: str = "DMR/DRI", rotulo_guia: str = "Guia") -> bytes:
     """Folha de controlo dos módulos de documentos (SS/IVA/IMI): quem tem
     documentos carregados e quem já recebeu o email."""
     wb = Workbook()
@@ -1698,7 +1768,7 @@ def gerar_excel_estado_mensal(titulo: str, base: pd.DataFrame, guias_set: set,
     ws["A1"].font = TITLE_FONT
     ws.merge_cells("A1:E1")
 
-    headers = ["N.º", "NIF", "Nome", "Email", "Língua", "Guia", rotulo_decl, "Extras", "Email Enviado"]
+    headers = ["N.º", "NIF", "Nome", "Email", "Língua", rotulo_guia, rotulo_decl, "Extras", "Email Enviado"]
     for i, h in enumerate(headers, start=1):
         c = ws.cell(row=4, column=i, value=h)
         c.font = HEADER_FONT
