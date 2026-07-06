@@ -254,13 +254,8 @@ with tab_emails:
         tpl = st.session_state.templates[n_pag_email]
 
         with st.expander("✏️ Editar template deste email (PT e EN)"):
-            if sou_admin():
-                editor_template_bilingue(tpl, f"ppc_tpl_{n_pag_email}", altura=300)
-                st.caption("Placeholders disponíveis: {nome} {nif} {email} {pag1} {pag2} {pag3} {total} {data1} {data2} {data3} {ano_dados} {ano_pagamentos}. Cada cliente recebe na língua definida no registo central (coluna 'Língua').")
-            else:
-                st.caption("Os templates de email são definidos pelo administrador.")
-                st.text_input("Assunto", value=tpl["assunto"], disabled=True)
-                st.text_area("Corpo", value=tpl["corpo"], height=300, disabled=True)
+            editor_template_bilingue(tpl, f"ppc_tpl_{n_pag_email}", altura=300)
+            st.caption("Placeholders disponíveis: {nome} {nif} {email} {pag1} {pag2} {pag3} {total} {data1} {data2} {data3} {ano_dados} {ano_pagamentos}. Cada cliente recebe na língua definida no registo central (coluna 'Língua'). Alterações aqui ficam guardadas para toda a equipa.")
 
         elegiveis = df_calc[~df_calc["Dispensado"]].copy()
         elegiveis = elegiveis[elegiveis["Email"].str.strip() != ""]
