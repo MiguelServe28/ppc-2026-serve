@@ -24,7 +24,7 @@ from common import (
     extrair_nif_de_filename,
     guardar_config_db,
     lista_meses_ss,
-    listar_extras_ss,
+    listar_extras_generico,
     marcar_ss_enviado_db,
     meu_email,
     montar_base_ss,
@@ -32,8 +32,7 @@ from common import (
     obter_documentos_ss,
     registar_log,
     render_template_ss,
-    sou_admin,
-    storage_listar,
+    storage_apagar,
     storage_upload_pdf,
 )
 
@@ -55,12 +54,15 @@ mes = st.selectbox(
     key="ss_mes",
 )
 
-# Estado deste mês (uma leitura por tipo de documento + estado de envio)
-dmrs_set = {n[:-4] for n in storage_listar(f"ss/{mes}/dmr") if n.lower().endswith(".pdf")}
-dris_set = {n[:-4] for n in storage_listar(f"ss/{mes}/dri") if n.lower().endswith(".pdf")}
-retencoes_set = {n[:-4] for n in storage_listar(f"ss/{mes}/retencoes") if n.lower().endswith(".pdf")}
-iuc_set = {n[:-4] for n in storage_listar(f"ss/{mes}/iuc") if n.lower().endswith(".pdf")}
-extras_dict = listar_extras_ss(mes)
+# Estado deste mês — cada categoria é {nif: [nome1.pdf, nome2.pdf, ...]},
+# porque agora um cliente pode ter mais do que um ficheiro na mesma categoria
+# (ex: 2 DMRs). O "Sim/Não" nas tabelas usa "nif in dicionario", que continua
+# a funcionar normalmente com dicts (verifica só as chaves).
+dmrs_dict = listar_extras_generico(f"ss/{mes}/dmr")
+dris_dict = listar_extras_generico(f"ss/{mes}/dri")
+retencoes_dict = listar_extras_generico(f"ss/{mes}/retencoes")
+iuc_dict = listar_extras_generico(f"ss/{mes}/iuc")
+extras_dict = listar_extras_generico(f"ss/{mes}/extra")
 enviados = carregar_ss_mes_db(mes)
 
 base_ss = base_ss.reset_index(drop=True)
@@ -77,6 +79,12 @@ with tab_docs:
     )
 
     st.markdown("**Carregamento em massa** (vários PDFs de uma vez, com o NIF no nome do ficheiro)")
+    st.caption(
+        "Todas as categorias aceitam mais do que um ficheiro para o mesmo cliente (ex: 2 DMRs) — "
+        "desde que os nomes dos ficheiros sejam diferentes. Se um cliente tiver 2 documentos da mesma "
+        "categoria, escreve algo depois do NIF para os distinguir (ex: '267894449_Entidade A.pdf' e "
+        "'267894449_Entidade B.pdf')."
+    )
     col_tipo, col_up = st.columns([1, 3])
     with col_tipo:
         tipo_doc = st.radio(
@@ -90,22 +98,22 @@ with tab_docs:
             "o que quiseres, ex: '267894449_IUC.pdf', para depois identificares o documento)",
             type=["pdf"], accept_multiple_files=True, key="ss_up_massa",
         )
-    PASTAS_TIPO_DOC = {"DMR": "dmr", "DRI": "dri", "Retenções": "retencoes", "IUC": "iuc"}
+    PASTAS_TIPO_DOC = {"DMR": "dmr", "DRI": "dri", "Retenções": "retencoes", "IUC": "iuc", "Outros documentos": "extra"}
     if up_massa:
         ids_upload = tuple(sorted(f"{f.name}_{f.size}" for f in up_massa))
         if st.session_state.get("_ss_massa_proc") != (mes, tipo_doc, ids_upload):
             st.session_state["_ss_massa_proc"] = (mes, tipo_doc, ids_upload)
+            pasta = PASTAS_TIPO_DOC[tipo_doc]
             ok, sem_nif = 0, []
             for f in up_massa:
                 nif_d = extrair_nif_de_filename(f.name)
                 if not nif_d:
                     sem_nif.append(f.name)
                     continue
-                if tipo_doc == "Outros documentos":
-                    label = extrair_label_extra(f.name, nif_d)
-                    storage_upload_pdf(f"ss/{mes}/extra/{nif_d}__{label}", f.getvalue())
-                else:
-                    storage_upload_pdf(f"ss/{mes}/{PASTAS_TIPO_DOC[tipo_doc]}/{nif_d}.pdf", f.getvalue())
+                label = extrair_label_extra(f.name, nif_d)
+                if tipo_doc != "Outros documentos" and label == "Documento.pdf":
+                    label = f"{tipo_doc}.pdf"  # só veio o NIF no nome -> usa o próprio tipo como etiqueta
+                storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_d}__{label}", f.getvalue())
                 ok += 1
             msg = f"{ok} ficheiro(s) associados e guardados no arquivo."
             if sem_nif:
@@ -121,41 +129,41 @@ with tab_docs:
         format_func=lambda n: f"{n} — {base_ss.loc[base_ss['NIF']==n,'Nome'].values[0]}",
         key="ss_cliente_doc",
     )
-    def _uploader_simples(col, rotulo: str, pasta: str, conjunto: set):
-        """Upload de 1 documento por cliente/mês para uma categoria fixa (DMR,
-        DRI, Retenções, IUC) — evita repetir a mesma lógica 4 vezes."""
+    def _gestor_documentos(col, rotulo: str, pasta: str, dicionario: dict, opcional: bool = False):
+        """Upload (aceita vários ficheiros) + lista com botão de apagar, para
+        uma categoria de documento (DMR, DRI, Retenções, IUC ou Outros) de um
+        cliente/mês. Suporta mais do que um ficheiro por cliente (ex: 2 DMRs)
+        e substituir um documento (apaga o antigo e carrega de novo)."""
         with col:
-            up = st.file_uploader(f"{rotulo} (PDF)", type=["pdf"], key=f"ss_up_{pasta}_{mes}_{nif_doc}")
-            if up is not None:
-                fid = f"{up.name}_{up.size}"
-                if st.session_state.get(f"_ss_{pasta}_proc_{mes}_{nif_doc}") != fid:
-                    storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_doc}.pdf", up.getvalue())
-                    st.session_state[f"_ss_{pasta}_proc_{mes}_{nif_doc}"] = fid
-                    conjunto.add(nif_doc)
-            st.caption(f"✅ {rotulo} no arquivo" if nif_doc in conjunto else f"❌ Sem {rotulo}")
+            rotulo_campo = f"{rotulo} (PDF{', opcional' if opcional else ''} — podes carregar mais do que um)"
+            up = st.file_uploader(rotulo_campo, type=["pdf"], accept_multiple_files=True,
+                                   key=f"ss_up_{pasta}_{mes}_{nif_doc}")
+            if up:
+                ids_up = tuple(sorted(f"{f.name}_{f.size}" for f in up))
+                if st.session_state.get(f"_ss_{pasta}_proc_{mes}_{nif_doc}") != ids_up:
+                    st.session_state[f"_ss_{pasta}_proc_{mes}_{nif_doc}"] = ids_up
+                    for f in up:
+                        storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_doc}__{f.name}", f.getvalue())
+                    st.success(f"{len(up)} ficheiro(s) de {rotulo} guardado(s).")
+                    st.rerun()
+            existentes = dicionario.get(nif_doc, [])
+            if existentes:
+                for nome in existentes:
+                    c_nome, c_apagar = st.columns([4, 1])
+                    c_nome.caption(f"📄 {nome}")
+                    if c_apagar.button("🗑️", key=f"apagar_{pasta}_{mes}_{nif_doc}_{nome}",
+                                        help="Apagar (depois podes carregar outro ficheiro em substituição)"):
+                        storage_apagar(f"ss/{mes}/{pasta}/{nif_doc}__{nome}")
+                        st.rerun()
+            else:
+                st.caption(f"Sem {rotulo}")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    _uploader_simples(c1, "DMR", "dmr", dmrs_set)
-    _uploader_simples(c2, "DRI", "dri", dris_set)
-    _uploader_simples(c3, "Retenções", "retencoes", retencoes_set)
-    _uploader_simples(c4, "IUC", "iuc", iuc_set)
-    with c5:
-        up_extras = st.file_uploader(
-            "Outros documentos (PDF, opcional)", type=["pdf"],
-            accept_multiple_files=True, key=f"ss_up_extra_{mes}_{nif_doc}",
-            help="Para qualquer outro pagamento que queiras aproveitar para enviar no mesmo email deste "
-                 "mês. O nome do ficheiro (ex: 'Contribuição Extra.pdf') é usado para identificar o documento.",
-        )
-        if up_extras:
-            ids_extras = tuple(sorted(f"{f.name}_{f.size}" for f in up_extras))
-            if st.session_state.get(f"_ss_extra_proc_{mes}_{nif_doc}") != ids_extras:
-                st.session_state[f"_ss_extra_proc_{mes}_{nif_doc}"] = ids_extras
-                for f in up_extras:
-                    storage_upload_pdf(f"ss/{mes}/extra/{nif_doc}__{f.name}", f.getvalue())
-                    extras_dict.setdefault(nif_doc, []).append(f.name)
-                st.success(f"{len(up_extras)} documento(s) extra guardados.")
-        n_extras = len(extras_dict.get(nif_doc, []))
-        st.caption(f"📎 {n_extras} extra(s) no arquivo" if n_extras else "Sem extras")
+    _gestor_documentos(c1, "DMR", "dmr", dmrs_dict)
+    _gestor_documentos(c2, "DRI", "dri", dris_dict)
+    _gestor_documentos(c3, "Retenções", "retencoes", retencoes_dict)
+    _gestor_documentos(c4, "IUC", "iuc", iuc_dict)
+    _gestor_documentos(c5, "Outros documentos", "extra", extras_dict, opcional=True)
 
     st.divider()
     st.markdown("**Estado do mês por cliente**")
@@ -163,10 +171,10 @@ with tab_docs:
     for _, r in base_ss.iterrows():
         rows.append({
             "N.º": r.get("Numero_Cliente", ""), "NIF": r["NIF"], "Nome": r["Nome"],
-            "DMR": "✅" if r["NIF"] in dmrs_set else "❌",
-            "DRI": "✅" if r["NIF"] in dris_set else "❌",
-            "Retenções": "✅" if r["NIF"] in retencoes_set else "❌",
-            "IUC": "✅" if r["NIF"] in iuc_set else "❌",
+            "DMR": "✅" if r["NIF"] in dmrs_dict else "❌",
+            "DRI": "✅" if r["NIF"] in dris_dict else "❌",
+            "Retenções": "✅" if r["NIF"] in retencoes_dict else "❌",
+            "IUC": "✅" if r["NIF"] in iuc_dict else "❌",
             "Extras": len(extras_dict.get(r["NIF"], [])),
             "Email Enviado": bool(r["Email_Enviado"]),
         })
@@ -188,9 +196,9 @@ with tab_docs:
         st.rerun()
 
     excel_ss = gerar_excel_estado_mensal(
-        f"Controlo Segurança Social — {nome_mes(mes)}", base_ss, dmrs_set, dris_set, extras_dict, enviados,
+        f"Controlo Segurança Social — {nome_mes(mes)}", base_ss, dmrs_dict, dris_dict, extras_dict, enviados,
         rotulo_guia="DMR", rotulo_decl="DRI",
-        extra_categorias=[("Retenções", retencoes_set), ("IUC", iuc_set)],
+        extra_categorias=[("Retenções", retencoes_dict), ("IUC", iuc_dict)],
     )
     st.download_button(
         "⬇️ Descarregar Excel de Controlo (SS)", excel_ss,
@@ -211,7 +219,7 @@ with tab_emails:
 
     com_docs = [
         n for n in elegiveis["NIF"]
-        if n in dmrs_set or n in dris_set or n in retencoes_set or n in iuc_set or n in extras_dict
+        if n in dmrs_dict or n in dris_dict or n in retencoes_dict or n in iuc_dict or n in extras_dict
     ]
     nao_enviados = [n for n in elegiveis["NIF"] if not enviados.get(n, False)]
 
@@ -223,7 +231,7 @@ with tab_emails:
     )
     if preview_nif:
         row = elegiveis[elegiveis["NIF"] == preview_nif].iloc[0]
-        docs = obter_documentos_ss(mes, preview_nif, dmrs_set, dris_set, retencoes_set, iuc_set, extras_dict)
+        docs = obter_documentos_ss(mes, preview_nif, dmrs_dict, dris_dict, retencoes_dict, iuc_dict, extras_dict)
         _, valores_prev = carregar_anexos_e_valores_ss(docs) if docs else ([], [])
         assunto, corpo = render_template_ss(tpl, row, mes, docs, valores_prev)
         st.text_input("Assunto (preview)", value=assunto, disabled=True)
@@ -281,7 +289,7 @@ with tab_emails:
             sucessos, falhas = 0, 0
             for i, nif in enumerate(selecionados):
                 row = elegiveis[elegiveis["NIF"] == nif].iloc[0]
-                docs = obter_documentos_ss(mes, nif, dmrs_set, dris_set, retencoes_set, iuc_set, extras_dict)
+                docs = obter_documentos_ss(mes, nif, dmrs_dict, dris_dict, retencoes_dict, iuc_dict, extras_dict)
                 anexos, valores = carregar_anexos_e_valores_ss(docs)
                 assunto, corpo = render_template_ss(tpl, row, mes, docs, valores)
                 try:
@@ -316,21 +324,16 @@ with tab_emails:
 # --- Template ----------------------------------------------------------------
 with tab_template:
     st.subheader("Template do Email da Segurança Social")
-    if sou_admin():
-        editor_template_bilingue(st.session_state.template_ss, "ss_tpl")
-        st.caption(
-            "Placeholders disponíveis: {nome} {nif} {email} {mes_nome} {data_limite} {lista_docs} {lista_valores}. "
-            "{mes_nome} e {data_limite} são calculados a partir do mês escolhido; {lista_docs} lista "
-            "automaticamente os documentos anexados a cada cliente (DMR, DRI, extras); {lista_valores} é o bloco "
-            "com os montantes lidos automaticamente de cada documento (ex: 'DMR - 45,00 €'), quando for possível "
-            "lê-los — fica vazio se não conseguir ler nenhum valor."
-        )
-    else:
-        st.caption("O template de email é definido pelo administrador.")
-        st.text_input("Assunto (PT)", value=st.session_state.template_ss.get("assunto", ""), disabled=True)
-        st.text_area("Corpo (PT)", value=st.session_state.template_ss.get("corpo", ""), height=260, disabled=True)
+    editor_template_bilingue(st.session_state.template_ss, "ss_tpl")
+    st.caption(
+        "Placeholders disponíveis: {nome} {nif} {email} {mes_nome} {data_limite} {lista_docs} {lista_valores}. "
+        "{mes_nome} e {data_limite} são calculados a partir do mês escolhido; {lista_docs} lista "
+        "automaticamente os documentos anexados a cada cliente (DMR, DRI, extras); {lista_valores} é o bloco "
+        "com os montantes lidos automaticamente de cada documento (ex: 'DMR - 45,00 €'), quando for possível "
+        "lê-los — fica vazio se não conseguir ler nenhum valor. Alterações aqui ficam guardadas para toda a equipa."
+    )
 
-# Persistir template caso o admin o tenha editado (RLS bloqueia gestores).
+# Persistir template (guardado para toda a equipa, qualquer utilizador pode editar).
 guardar_config_db(
     st.session_state.params, st.session_state.templates,
     st.session_state.get("template_irs"), st.session_state.get("template_ss"),
