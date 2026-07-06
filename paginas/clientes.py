@@ -1,326 +1,170 @@
 """
-Página da Segurança Social — envio mensal de DMR, DRI e outros documentos
-avulsos (ex: IUC, retenções). Tudo organizado por mês de referência:
-escolhe-se o mês, carregam-se os documentos (ficam no arquivo persistente,
-identificados pelo NIF no nome do ficheiro) e enviam-se os emails. Quando
-possível, o valor de cada documento é lido automaticamente do PDF e listado
-no corpo do email. Pagamento até dia 25 do mês seguinte ao mês de referência.
+Clientes — registo central, partilhado por toda a plataforma. Não tem nada
+específico de nenhum imposto: NIF, contactos, gestor, tipos e os interruptores
+que decidem em que páginas de imposto cada cliente aparece.
 """
-
-from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
 from common import (
-    carregar_anexos_e_valores_ss,
-    carregar_ss_mes_db,
-    data_limite_ss,
-    editor_template_bilingue,
-    gerar_excel_estado_mensal,
-    enviar_email,
-    escolher_conta_email,
-    extrair_label_extra,
-    extrair_nif_de_filename,
-    guardar_config_db,
-    lista_meses_ss,
-    listar_extras_ss,
-    marcar_ss_enviado_db,
+    PPC_COLS,
+    PPC_NUM_COLS,
+    carregar_ppc_db,
+    clean_clientes_df,
+    clean_ppc_df,
+    ler_ficheiro_importacao,
     meu_email,
-    montar_base_ss,
-    nome_mes,
-    obter_documentos_ss,
-    registar_log,
-    render_template_ss,
+    nifs_invalidos,
+    persistir_clientes,
+    persistir_clientes_parcial,
+    persistir_ppc,
     sou_admin,
-    storage_listar,
-    storage_upload_pdf,
 )
 
-st.title("🏛️ Segurança Social — DMR / DRI")
-st.caption("SERVE — Contabilidade e Viabilização Empresarial")
-
-base_ss = montar_base_ss()
-if base_ss.empty:
-    st.info("Ainda não há clientes com o pisco 'Seg. Social' ligado — ativa-o na página 'Clientes'.")
-    st.stop()
-
-# --- Seletor do mês de referência -------------------------------------------
-meses = lista_meses_ss(18)
-mes = st.selectbox(
-    "Mês de referência (remunerações)",
-    meses,
-    index=1 if len(meses) > 1 else 0,  # por omissão, o mês anterior ao atual
-    format_func=lambda m: f"{nome_mes(m)}  —  pagamento até {data_limite_ss(m).strftime('%d/%m/%Y')}",
-    key="ss_mes",
+st.title("📋 Registo Central de Clientes")
+st.caption(
+    "Esta tabela é partilhada por toda a plataforma. Os 'Tipos' são só categorização. "
+    "Os interruptores 'Aplica' são manuais e decidem em que módulos (PPC, IVA, IMI, IRS, Segurança Social) "
+    "este cliente aparece — um cliente pode ter vários ligados ao mesmo tempo."
 )
+if not sou_admin():
+    st.caption(f"Vês o registo completo de toda a equipa. Os teus clientes ({meu_email()}) são os que apareces como Gestor.")
 
-# Estado deste mês (uma leitura por tipo de documento + estado de envio)
-dmrs_set = {n[:-4] for n in storage_listar(f"ss/{mes}/dmr") if n.lower().endswith(".pdf")}
-dris_set = {n[:-4] for n in storage_listar(f"ss/{mes}/dri") if n.lower().endswith(".pdf")}
-extras_dict = listar_extras_ss(mes)
-enviados = carregar_ss_mes_db(mes)
-
-base_ss = base_ss.reset_index(drop=True)
-base_ss["Email_Enviado"] = base_ss["NIF"].map(lambda n: enviados.get(n, False))
-
-tab_docs, tab_emails, tab_template = st.tabs(["📎 Documentos", "✉️ Emails", "✏️ Template de Email"])
-
-# --- Documentos --------------------------------------------------------------
-with tab_docs:
-    st.subheader(f"Documentos de {nome_mes(mes)}")
-    st.caption(
-        "Os documentos ficam guardados no arquivo persistente — não se perdem ao fechar o browser. "
-        "Podes carregar em massa (o NIF no nome do ficheiro associa sozinho) ou cliente a cliente."
+col1, col2 = st.columns([2, 1])
+with col1:
+    up = st.file_uploader(
+        "Importar CSV ou Excel (colunas mínimas: NIF, N.º, Nome, Email, Lingua, Gestor, Email Gestor — "
+        "usa o template abaixo. Opcionalmente também Volume, Coleta, Retencoes para já entrarem no PPC)",
+        type=["csv", "xlsx"],
     )
+    if up is not None:
+        try:
+            bruto = ler_ficheiro_importacao(up)
+            tem_dados_ppc = any(c in bruto.columns for c in PPC_NUM_COLS)
 
-    st.markdown("**Carregamento em massa** (vários PDFs de uma vez, com o NIF no nome do ficheiro)")
-    col_tipo, col_up = st.columns([1, 3])
-    with col_tipo:
-        tipo_doc = st.radio("Tipo de documento", ["DMR", "DRI", "Outros documentos"], key="ss_tipo_doc")
-    with col_up:
-        up_massa = st.file_uploader(
-            "Carregar PDFs (nome a começar pelo NIF de 9 dígitos — o resto do nome pode ser "
-            "o que quiseres, ex: '267894449_IUC.pdf', para depois identificares o documento)",
-            type=["pdf"], accept_multiple_files=True, key="ss_up_massa",
-        )
-    if up_massa:
-        ids_upload = tuple(sorted(f"{f.name}_{f.size}" for f in up_massa))
-        if st.session_state.get("_ss_massa_proc") != (mes, tipo_doc, ids_upload):
-            st.session_state["_ss_massa_proc"] = (mes, tipo_doc, ids_upload)
-            ok, sem_nif = 0, []
-            for f in up_massa:
-                nif_d = extrair_nif_de_filename(f.name)
-                if not nif_d:
-                    sem_nif.append(f.name)
-                    continue
-                if tipo_doc == "Outros documentos":
-                    label = extrair_label_extra(f.name, nif_d)
-                    storage_upload_pdf(f"ss/{mes}/extra/{nif_d}__{label}", f.getvalue())
+            novo_clientes = clean_clientes_df(bruto)
+            invalidos_import = nifs_invalidos(novo_clientes)
+            if invalidos_import:
+                st.warning(f"⚠️ Este ficheiro tem NIFs com dígito de controlo inválido (confirma se estão bem escritos): {', '.join(invalidos_import)}")
+            if tem_dados_ppc:
+                novo_clientes["Aplica_PPC"] = True  # importação clássica de PPC -> liga logo o interruptor
+
+            novo_ppc = clean_ppc_df(bruto) if tem_dados_ppc else pd.DataFrame(columns=PPC_COLS)
+
+            modo = st.radio("Modo de importação", ["Substituir tudo", "Adicionar aos existentes"], horizontal=True, key="modo_import")
+            if st.button("Confirmar importação"):
+                if modo == "Substituir tudo":
+                    persistir_clientes(novo_clientes)
                 else:
-                    pasta = "dmr" if tipo_doc == "DMR" else "dri"
-                    storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_d}.pdf", f.getvalue())
-                ok += 1
-            msg = f"{ok} ficheiro(s) associados e guardados no arquivo."
-            if sem_nif:
-                msg += f" Sem NIF no nome (usa o carregamento por cliente, abaixo): {', '.join(sem_nif)}"
-            st.success(msg)
-            st.rerun()
+                    persistir_clientes(
+                        clean_clientes_df(pd.concat([st.session_state.clientes, novo_clientes], ignore_index=True))
+                        .drop_duplicates(subset="NIF", keep="last")
+                    )
+                # Sincroniza (pode ter havido eliminações em cascata de ppc_dados) e funde os novos dados de PPC.
+                st.session_state.ppc_dados = carregar_ppc_db()
+                if not novo_ppc.empty:
+                    persistir_ppc(
+                        clean_ppc_df(pd.concat([st.session_state.ppc_dados, novo_ppc], ignore_index=True))
+                        .drop_duplicates(subset="NIF", keep="last")
+                    )
+                st.success(f"{len(novo_clientes)} clientes importados e guardados.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao importar: {e}")
+with col2:
+    template_csv = pd.DataFrame(
+        [{"NIF": "500123456", "N.º": "123", "Nome": "Empresa Exemplo, Lda.", "Email": "geral@exemplo.pt",
+          "Lingua": "PT", "Gestor": "Ana Gestora", "Email Gestor": "ana@serve.pt"}]
+    ).to_csv(index=False, sep=";")
+    st.download_button("📥 Template CSV", template_csv, file_name="template_clientes.csv", mime="text/csv")
 
-    st.divider()
-    st.markdown("**Carregamento por cliente** (inclui outros documentos avulsos)")
-    nif_doc = st.selectbox(
-        "Cliente",
-        base_ss["NIF"].tolist(),
-        format_func=lambda n: f"{n} — {base_ss.loc[base_ss['NIF']==n,'Nome'].values[0]}",
-        key="ss_cliente_doc",
+st.divider()
+FILTROS_IMPOSTO = {
+    "Todos": None,
+    "Só PPC": "Aplica_PPC",
+    "Só IVA": "Aplica_IVA",
+    "Só IMI": "Aplica_IMI",
+    "Só IRS": "Aplica_IRS",
+    "Só Segurança Social": "Aplica_SS",
+    "Sem nenhum imposto atribuído": "__nenhum__",
+}
+col_filtro, col_pesquisa = st.columns([1, 2])
+with col_filtro:
+    filtro_escolhido = st.selectbox(
+        "Mostrar",
+        list(FILTROS_IMPOSTO.keys()),
+        key="filtro_clientes",
+        help="Filtra a tabela abaixo — útil para veres só os clientes de um imposto (ex: os que só têm IRS) sem os teres misturados visualmente com os restantes.",
     )
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        up_dmr = st.file_uploader("DMR (PDF)", type=["pdf"], key=f"ss_up_dmr_{mes}_{nif_doc}")
-        if up_dmr is not None:
-            fid = f"{up_dmr.name}_{up_dmr.size}"
-            if st.session_state.get(f"_ss_dmr_proc_{mes}_{nif_doc}") != fid:
-                storage_upload_pdf(f"ss/{mes}/dmr/{nif_doc}.pdf", up_dmr.getvalue())
-                st.session_state[f"_ss_dmr_proc_{mes}_{nif_doc}"] = fid
-                dmrs_set.add(nif_doc)
-        st.caption("✅ DMR no arquivo" if nif_doc in dmrs_set else "❌ Sem DMR")
-    with c2:
-        up_dri = st.file_uploader("DRI (PDF)", type=["pdf"], key=f"ss_up_dri_{mes}_{nif_doc}")
-        if up_dri is not None:
-            fid = f"{up_dri.name}_{up_dri.size}"
-            if st.session_state.get(f"_ss_dri_proc_{mes}_{nif_doc}") != fid:
-                storage_upload_pdf(f"ss/{mes}/dri/{nif_doc}.pdf", up_dri.getvalue())
-                st.session_state[f"_ss_dri_proc_{mes}_{nif_doc}"] = fid
-                dris_set.add(nif_doc)
-        st.caption("✅ DRI no arquivo" if nif_doc in dris_set else "❌ Sem DRI")
-    with c3:
-        up_extras = st.file_uploader(
-            "Outros documentos (PDF, opcional)", type=["pdf"],
-            accept_multiple_files=True, key=f"ss_up_extra_{mes}_{nif_doc}",
-            help="Ex: IUC, retenções, ou outro pagamento que queiras aproveitar para enviar no mesmo "
-                 "email deste mês. O nome do ficheiro (ex: 'IUC.pdf') é usado para identificar o documento.",
-        )
-        if up_extras:
-            ids_extras = tuple(sorted(f"{f.name}_{f.size}" for f in up_extras))
-            if st.session_state.get(f"_ss_extra_proc_{mes}_{nif_doc}") != ids_extras:
-                st.session_state[f"_ss_extra_proc_{mes}_{nif_doc}"] = ids_extras
-                for f in up_extras:
-                    storage_upload_pdf(f"ss/{mes}/extra/{nif_doc}__{f.name}", f.getvalue())
-                    extras_dict.setdefault(nif_doc, []).append(f.name)
-                st.success(f"{len(up_extras)} documento(s) extra guardados.")
-        n_extras = len(extras_dict.get(nif_doc, []))
-        st.caption(f"📎 {n_extras} extra(s) no arquivo" if n_extras else "Sem extras")
+with col_pesquisa:
+    pesquisa = st.text_input(
+        "🔍 Pesquisar por nome ou NIF",
+        key="pesquisa_clientes",
+        placeholder="Ex: 'Silva' ou '500123456' — deixa vazio para ver todos",
+    ).strip()
 
-    st.divider()
-    st.markdown("**Estado do mês por cliente**")
-    rows = []
-    for _, r in base_ss.iterrows():
-        rows.append({
-            "N.º": r.get("Numero_Cliente", ""), "NIF": r["NIF"], "Nome": r["Nome"],
-            "DMR": "✅" if r["NIF"] in dmrs_set else "❌",
-            "DRI": "✅" if r["NIF"] in dris_set else "❌",
-            "Extras": len(extras_dict.get(r["NIF"], [])),
-            "Email Enviado": bool(r["Email_Enviado"]),
-        })
-    estado_df = pd.DataFrame(rows)
-    editado = st.data_editor(
-        estado_df,
-        use_container_width=True,
-        hide_index=True,
-        height=360,
-        disabled=["N.º", "NIF", "Nome", "DMR", "DRI", "Extras"],
-        column_config={"Email Enviado": st.column_config.CheckboxColumn("Email Enviado")},
-        key=f"ss_estado_{mes}",
+todos_clientes = clean_clientes_df(st.session_state.clientes)
+coluna_filtro = FILTROS_IMPOSTO[filtro_escolhido]
+if coluna_filtro is None:
+    clientes_mostrados = todos_clientes
+elif coluna_filtro == "__nenhum__":
+    nenhum_aplica = ~(todos_clientes["Aplica_PPC"] | todos_clientes["Aplica_IVA"] | todos_clientes["Aplica_IMI"]
+                       | todos_clientes["Aplica_IRS"] | todos_clientes["Aplica_SS"])
+    clientes_mostrados = todos_clientes[nenhum_aplica]
+else:
+    clientes_mostrados = todos_clientes[todos_clientes[coluna_filtro]]
+
+if pesquisa:
+    mascara = (
+        clientes_mostrados["Nome"].str.contains(pesquisa, case=False, na=False)
+        | clientes_mostrados["NIF"].str.contains(pesquisa, na=False)
     )
-    if st.button("💾 Guardar piscos 'Email Enviado'"):
-        for _, r in editado.iterrows():
-            if bool(r["Email Enviado"]) != enviados.get(r["NIF"], False):
-                marcar_ss_enviado_db(r["NIF"], mes, bool(r["Email Enviado"]))
-        st.success("Estado guardado.")
-        st.rerun()
+    clientes_mostrados = clientes_mostrados[mascara]
 
-    excel_ss = gerar_excel_estado_mensal(
-        f"Controlo Segurança Social — {nome_mes(mes)}", base_ss, dmrs_set, dris_set, extras_dict, enviados,
-        rotulo_guia="DMR", rotulo_decl="DRI",
-    )
-    st.download_button(
-        "⬇️ Descarregar Excel de Controlo (SS)", excel_ss,
-        file_name=f"Controlo_SS_{mes}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+nifs_visiveis_antes = set(clientes_mostrados["NIF"])
+st.caption(f"A mostrar {len(clientes_mostrados)} de {len(todos_clientes)} cliente(s) no total.")
 
-# --- Emails ------------------------------------------------------------------
-with tab_emails:
-    st.subheader(f"Enviar Emails — {nome_mes(mes)}")
+invalidos_atuais = nifs_invalidos(clientes_mostrados)
+if invalidos_atuais:
+    st.warning(f"⚠️ NIFs com dígito de controlo inválido nesta lista (provável erro de digitação): {', '.join(invalidos_atuais)}")
 
-    elegiveis = base_ss[base_ss["Email"].str.strip() != ""].copy()
-    sem_email = len(base_ss) - len(elegiveis)
-    if sem_email:
-        st.caption(f"⚠️ {sem_email} cliente(s) sem email preenchido no registo central — não aparecem abaixo.")
+st.markdown("**Tabela de clientes** — pode editar diretamente, adicionar ou apagar linhas.")
+col_config = {
+    "Numero_Cliente": st.column_config.TextColumn("N.º"),
+    "Lingua": st.column_config.SelectboxColumn("Língua", options=["PT", "EN"], help="Os emails deste cliente são enviados nesta língua (em todos os módulos)."),
+    "IVA_Regime": st.column_config.SelectboxColumn("Regime IVA", options=["Trimestral", "Mensal"], help="Define em que períodos este cliente aparece na página do IVA."),
+    "IRS_Avulso": st.column_config.CheckboxColumn("Só IRS (avulso)", help="Cliente importado apenas pelo menu do IRS — não é cliente de avença."),
+    "Tipo_Empresa": st.column_config.CheckboxColumn("Empresa"),
+    "Tipo_AL": st.column_config.CheckboxColumn("Aloj. Local"),
+    "Tipo_Trab_Independente": st.column_config.CheckboxColumn("Trab. Independente"),
+    "Tipo_Rep_Fiscal": st.column_config.CheckboxColumn("Repr. Fiscal"),
+    "Aplica_PPC": st.column_config.CheckboxColumn("PPC"),
+    "Aplica_IVA": st.column_config.CheckboxColumn("IVA"),
+    "Aplica_IMI": st.column_config.CheckboxColumn("IMI"),
+    "Aplica_IRS": st.column_config.CheckboxColumn("IRS"),
+    "Aplica_SS": st.column_config.CheckboxColumn("Seg. Social"),
+}
+if sou_admin():
+    col_config["Gestor_Nome"] = st.column_config.TextColumn("Gestor (nome)")
+    col_config["Gestor_Email"] = st.column_config.TextColumn("Gestor (email, vai em CC)")
+else:
+    col_config["Gestor_Nome"] = st.column_config.TextColumn("Gestor (nome)", disabled=True)
+    col_config["Gestor_Email"] = st.column_config.TextColumn("Gestor (email)", disabled=True)
 
-    tpl = st.session_state.template_ss
-
-    com_docs = [n for n in elegiveis["NIF"] if n in dmrs_set or n in dris_set or n in extras_dict]
-    nao_enviados = [n for n in elegiveis["NIF"] if not enviados.get(n, False)]
-
-    preview_nif = st.selectbox(
-        "Pré-visualizar cliente:",
-        elegiveis["NIF"].tolist(),
-        format_func=lambda n: f"{n} — {elegiveis.loc[elegiveis['NIF']==n,'Nome'].values[0]}",
-        key=f"ss_preview_{mes}",
-    )
-    if preview_nif:
-        row = elegiveis[elegiveis["NIF"] == preview_nif].iloc[0]
-        docs = obter_documentos_ss(mes, preview_nif, dmrs_set, dris_set, extras_dict)
-        _, valores_prev = carregar_anexos_e_valores_ss(docs) if docs else ([], [])
-        assunto, corpo = render_template_ss(tpl, row, mes, docs, valores_prev)
-        st.text_input("Assunto (preview)", value=assunto, disabled=True)
-        if row["Gestor_Email"]:
-            st.caption(f"📋 CC: {row['Gestor_Nome'] or ''} <{row['Gestor_Email']}>  ·  Língua: {row['Lingua']}")
-        else:
-            st.caption(f"📋 CC: — (sem gestor definido)  ·  Língua: {row['Lingua']}")
-        st.text_area("Corpo (preview)", value=corpo, height=260, disabled=True)
-        st.caption("📎 Anexos: " + (", ".join(d["tipo"] for d in docs) if docs else "nenhum documento carregado ainda"))
-        if not valores_prev and docs:
-            st.caption("ℹ️ Não foi possível ler automaticamente o valor de nenhum destes documentos — confirma manualmente se precisares de indicar montantes.")
-
-        docs_prev = docs
-        ja_enviado_prev = enviados.get(preview_nif, False)
-
-    st.divider()
-    smtp_cfg = escolher_conta_email("ss")
-
-    st.markdown(f"📎 **{len(com_docs)} de {len(elegiveis)}** cliente(s) já têm documentos carregados para este mês.")
-
-    multiselect_key = f"ss_selecionados_{mes}"
-    col_b1, col_b2, col_b3 = st.columns(3)
-    with col_b1:
-        if st.button("📎 Selecionar quem tem documentos e falta enviar"):
-            st.session_state[multiselect_key] = [n for n in com_docs if n in nao_enviados]
-            st.rerun()
-    with col_b2:
-        if st.button("☑️ Selecionar todos por enviar"):
-            st.session_state[multiselect_key] = nao_enviados
-            st.rerun()
-    with col_b3:
-        if st.button("✖️ Limpar seleção"):
-            st.session_state[multiselect_key] = []
-            st.rerun()
-
-    if multiselect_key not in st.session_state:
-        st.session_state[multiselect_key] = [n for n in com_docs if n in nao_enviados]
-
-    selecionados = st.multiselect(
-        "Clientes selecionados para envio (podes ajustar — para enviar só um, deixa só esse)",
-        elegiveis["NIF"].tolist(),
-        format_func=lambda n: f"{n} — {elegiveis.loc[elegiveis['NIF']==n,'Nome'].values[0]}"
-        + ("" if n in com_docs else "  ⚠️ sem documentos")
-        + ("  ✅ já enviado" if enviados.get(n, False) else ""),
-        key=multiselect_key,
-    )
-
-    if st.button("🚀 Enviar Emails Selecionados", type="primary", disabled=not selecionados):
-        if not smtp_cfg["utilizador"] or not smtp_cfg["password"]:
-            st.error("Escolhe ou cria uma conta de email com utilizador e password preenchidos.")
-        else:
-            progress = st.progress(0.0)
-            status_box = st.empty()
-            assinatura = st.session_state.params.get("assinatura_html", "")
-            sucessos, falhas = 0, 0
-            for i, nif in enumerate(selecionados):
-                row = elegiveis[elegiveis["NIF"] == nif].iloc[0]
-                docs = obter_documentos_ss(mes, nif, dmrs_set, dris_set, extras_dict)
-                anexos, valores = carregar_anexos_e_valores_ss(docs)
-                assunto, corpo = render_template_ss(tpl, row, mes, docs, valores)
-                try:
-                    cc_gestor = [row["Gestor_Email"]] if row["Gestor_Email"] else []
-                    enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor, assinatura_html=assinatura)
-                    marcar_ss_enviado_db(nif, mes, True)
-                    registar_log({
-                        "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif,
-                        "nome": row["Nome"], "pagamento": 0, "estado": f"Enviado ({mes})",
-                        "modulo": "SS", "enviado_por": meu_email(),
-                    })
-                    sucessos += 1
-                except Exception as e:
-                    registar_log({
-                        "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif,
-                        "nome": row["Nome"], "pagamento": 0, "estado": f"Erro ({mes}): {e}",
-                        "modulo": "SS", "enviado_por": meu_email(),
-                    })
-                    falhas += 1
-                progress.progress((i + 1) / len(selecionados))
-                status_box.text(f"{i+1}/{len(selecionados)} — {row['Nome']}")
-            st.success(f"Concluído: {sucessos} enviados, {falhas} com erro. Estados guardados.")
-            st.rerun()
-
-    if st.session_state.log_envio:
-        st.markdown("### Log de Envios")
-        log_df = pd.DataFrame(st.session_state.log_envio)
-        if "modulo" in log_df.columns:
-            log_df = log_df[log_df["modulo"] == "SS"] if st.checkbox("Mostrar só Segurança Social", value=True, key="ss_log_filtro") else log_df
-        st.dataframe(log_df, use_container_width=True, height=220)
-
-# --- Template ----------------------------------------------------------------
-with tab_template:
-    st.subheader("Template do Email da Segurança Social")
-    if sou_admin():
-        editor_template_bilingue(st.session_state.template_ss, "ss_tpl")
-        st.caption(
-            "Placeholders disponíveis: {nome} {nif} {email} {mes_nome} {data_limite} {lista_docs} {lista_valores}. "
-            "{mes_nome} e {data_limite} são calculados a partir do mês escolhido; {lista_docs} lista "
-            "automaticamente os documentos anexados a cada cliente (DMR, DRI, extras); {lista_valores} é o bloco "
-            "com os montantes lidos automaticamente de cada documento (ex: 'DMR - 45,00 €'), quando for possível "
-            "lê-los — fica vazio se não conseguir ler nenhum valor."
-        )
-    else:
-        st.caption("O template de email é definido pelo administrador.")
-        st.text_input("Assunto (PT)", value=st.session_state.template_ss.get("assunto", ""), disabled=True)
-        st.text_area("Corpo (PT)", value=st.session_state.template_ss.get("corpo", ""), height=260, disabled=True)
-
-# Persistir template caso o admin o tenha editado (RLS bloqueia gestores).
-guardar_config_db(
-    st.session_state.params, st.session_state.templates,
-    st.session_state.get("template_irs"), st.session_state.get("template_ss"),
+edited = st.data_editor(
+    clientes_mostrados,
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config=col_config,
+    key="editor_clientes",
 )
+if st.button("💾 Guardar alterações à tabela"):
+    edited_final = clean_clientes_df(edited)
+    if coluna_filtro not in (None, "__nenhum__"):
+        # Uma linha nova adicionada enquanto este filtro está ativo assume-se que é para este imposto.
+        novas = ~edited_final["NIF"].isin(nifs_visiveis_antes)
+        edited_final.loc[novas, coluna_filtro] = True
+    persistir_clientes_parcial(edited_final, nifs_visiveis_antes)
+    st.success("Tabela atualizada e guardada — os dados ficam gravados mesmo depois de fechares o browser.")
+    st.rerun()
