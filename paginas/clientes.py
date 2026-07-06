@@ -34,9 +34,8 @@ if not sou_admin():
 col1, col2 = st.columns([2, 1])
 with col1:
     up = st.file_uploader(
-        "Importar CSV ou Excel (colunas mínimas: NIF, Nome, Email, Gestor_Nome, Gestor_Email; "
-        "opcionalmente também Volume, Coleta, Retencoes para já entrarem no PPC — os nomes antigos "
-        "com ano, tipo Volume_2025, também são aceites)",
+        "Importar CSV ou Excel (colunas mínimas: NIF, N.º, Nome, Email, Lingua, Gestor, Email Gestor — "
+        "usa o template abaixo. Opcionalmente também Volume, Coleta, Retencoes para já entrarem no PPC)",
         type=["csv", "xlsx"],
     )
     if up is not None:
@@ -75,9 +74,8 @@ with col1:
             st.error(f"Erro ao importar: {e}")
 with col2:
     template_csv = pd.DataFrame(
-        [{"N.º": "123", "NIF": "500123456", "Nome": "Empresa Exemplo, Lda.", "Email": "geral@exemplo.pt",
-          "Lingua": "PT", "Gestor_Nome": "Ana Gestora", "Gestor_Email": "ana@serve.pt",
-          "Volume": 10000, "Coleta": 2000, "Retencoes": 200}]
+        [{"NIF": "500123456", "N.º": "123", "Nome": "Empresa Exemplo, Lda.", "Email": "geral@exemplo.pt",
+          "Lingua": "PT", "Gestor": "Ana Gestora", "Email Gestor": "ana@serve.pt"}]
     ).to_csv(index=False, sep=";")
     st.download_button("📥 Template CSV", template_csv, file_name="template_clientes.csv", mime="text/csv")
 
