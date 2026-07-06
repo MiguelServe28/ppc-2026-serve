@@ -1431,8 +1431,9 @@ def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
 # ---------------------------------------------------------------------------
 # Segurança Social (DMR/DRI) — envio mensal de declarações e guias.
 # Estado "email enviado" guardado por cliente e por mês na tabela ss_dados.
-# Documentos no Storage: ss/<mes>/dmr/<nif>.pdf, ss/<mes>/dri/<nif>.pdf e
-# extras em ss/<mes>/extra/<nif>__<nome do ficheiro> (ex: "IUC.pdf").
+# Documentos no Storage: ss/<mes>/dmr/<nif>.pdf, ss/<mes>/dri/<nif>.pdf,
+# ss/<mes>/retencoes/<nif>.pdf, ss/<mes>/iuc/<nif>.pdf, e outros avulsos em
+# ss/<mes>/extra/<nif>__<nome do ficheiro>.
 # ---------------------------------------------------------------------------
 MESES_PT = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
             "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
@@ -1513,16 +1514,21 @@ def montar_base_ss() -> pd.DataFrame:
     return clientes[clientes["Aplica_SS"]].copy()
 
 
-def obter_documentos_ss(mes: str, nif: str, dmrs_set: set, dris_set: set, extras_dict: dict) -> list:
+def obter_documentos_ss(mes: str, nif: str, dmrs_set: set, dris_set: set,
+                         retencoes_set: set, iuc_set: set, extras_dict: dict) -> list:
     """Lista dos documentos disponíveis para um cliente neste mês, a partir dos
     conjuntos já lidos do Storage (para não fazer chamadas a mais). Devolve uma
     lista de dicts {tipo, caminho, anexo} — 'tipo' é a etiqueta usada no email
-    e no Excel (DMR, DRI, ou o nome do documento extra, ex: IUC)."""
+    e no Excel (DMR, DRI, Retenções, IUC, ou o nome do documento extra)."""
     docs = []
     if nif in dmrs_set:
         docs.append({"tipo": "DMR", "caminho": f"ss/{mes}/dmr/{nif}.pdf", "anexo": f"DMR_{mes}_{nif}.pdf"})
     if nif in dris_set:
         docs.append({"tipo": "DRI", "caminho": f"ss/{mes}/dri/{nif}.pdf", "anexo": f"DRI_{mes}_{nif}.pdf"})
+    if nif in retencoes_set:
+        docs.append({"tipo": "Retenções", "caminho": f"ss/{mes}/retencoes/{nif}.pdf", "anexo": f"Retencoes_{mes}_{nif}.pdf"})
+    if nif in iuc_set:
+        docs.append({"tipo": "IUC", "caminho": f"ss/{mes}/iuc/{nif}.pdf", "anexo": f"IUC_{mes}_{nif}.pdf"})
     for nome_extra in extras_dict.get(nif, []):
         docs.append({
             "tipo": nome_extra.rsplit(".", 1)[0] if "." in nome_extra else nome_extra,
@@ -1746,7 +1752,11 @@ def render_template_docs(template: dict, row: pd.Series, docs: list, rotulo_prin
 
 def gerar_excel_estado_mensal(titulo: str, base: pd.DataFrame, guias_set: set,
                               decl_set: set, extras_dict: dict, enviados: dict,
-                              rotulo_decl: str = "DMR/DRI", rotulo_guia: str = "Guia") -> bytes:
+                              rotulo_decl: str = "DMR/DRI", rotulo_guia: str = "Guia",
+                              extra_categorias: list = None) -> bytes:
+    """'extra_categorias' permite acrescentar mais colunas de Sim/Não além das
+    duas principais (guia/decl) — ex: [("Retenções", retencoes_set), ("IUC", iuc_set)]."""
+    extra_categorias = extra_categorias or []
     """Folha de controlo dos módulos de documentos (SS/IVA/IMI): quem tem
     documentos carregados e quem já recebeu o email."""
     wb = Workbook()
@@ -1768,7 +1778,8 @@ def gerar_excel_estado_mensal(titulo: str, base: pd.DataFrame, guias_set: set,
     ws["A1"].font = TITLE_FONT
     ws.merge_cells("A1:E1")
 
-    headers = ["N.º", "NIF", "Nome", "Email", "Língua", rotulo_guia, rotulo_decl, "Extras", "Email Enviado"]
+    headers = (["N.º", "NIF", "Nome", "Email", "Língua", rotulo_guia, rotulo_decl]
+               + [rotulo for rotulo, _ in extra_categorias] + ["Extras", "Email Enviado"])
     for i, h in enumerate(headers, start=1):
         c = ws.cell(row=4, column=i, value=h)
         c.font = HEADER_FONT
@@ -1777,20 +1788,20 @@ def gerar_excel_estado_mensal(titulo: str, base: pd.DataFrame, guias_set: set,
         c.border = BORDER
     ws.row_dimensions[4].height = 30
 
-    widths = [9, 12, 30, 26, 8, 9, 11, 9, 13]
+    widths = [9, 12, 30, 26, 8, 9, 11] + [10] * len(extra_categorias) + [9, 13]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     row = 5
     for _, r in base.iterrows():
         nif = r["NIF"]
-        vals = [
-            r.get("Numero_Cliente", ""), nif, r["Nome"], r["Email"], r.get("Lingua", "PT"),
-            "Sim" if nif in guias_set else "Não",
-            "Sim" if nif in decl_set else "Não",
-            len(extras_dict.get(nif, [])),
-            "Sim" if enviados.get(nif, False) else "Não",
-        ]
+        vals = (
+            [r.get("Numero_Cliente", ""), nif, r["Nome"], r["Email"], r.get("Lingua", "PT"),
+             "Sim" if nif in guias_set else "Não",
+             "Sim" if nif in decl_set else "Não"]
+            + ["Sim" if nif in categoria_set else "Não" for _, categoria_set in extra_categorias]
+            + [len(extras_dict.get(nif, [])), "Sim" if enviados.get(nif, False) else "Não"]
+        )
         for i, v in enumerate(vals, start=1):
             c = ws.cell(row=row, column=i, value=v)
             c.font = BLACK
