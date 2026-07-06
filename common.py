@@ -33,7 +33,7 @@ CLIENT_COLS = [
     "NIF", "Numero_Cliente", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email",
     "Tipo_Empresa", "Tipo_AL", "Tipo_Trab_Independente", "Tipo_Rep_Fiscal",
     "Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_IRS", "Aplica_SS",
-    "IRS_Avulso", "Notas",
+    "IVA_Regime", "IRS_Avulso", "Notas",
 ]
 TIPO_COLS = ["Tipo_Empresa", "Tipo_AL", "Tipo_Trab_Independente", "Tipo_Rep_Fiscal"]
 APLICA_COLS = ["Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_IRS", "Aplica_SS"]
@@ -41,7 +41,8 @@ APLICA_COLS = ["Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_IRS", "Aplica_S
 # da base central) — permite separar "avença" de "só IRS" na Visão Geral do IRS.
 BOOL_COLS = TIPO_COLS + APLICA_COLS + ["IRS_Avulso"]
 # Lingua: "PT" ou "EN" — decide em que língua os emails deste cliente são enviados.
-TEXT_COLS = ["NIF", "Numero_Cliente", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email", "Notas"]
+# IVA_Regime: "Mensal" ou "Trimestral" — decide os períodos na página do IVA.
+TEXT_COLS = ["NIF", "Numero_Cliente", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email", "IVA_Regime", "Notas"]
 
 COLUMN_MAP_TO_DB = {
     "NIF": "nif", "Numero_Cliente": "numero_cliente", "Nome": "nome", "Email": "email",
@@ -50,7 +51,7 @@ COLUMN_MAP_TO_DB = {
     "Tipo_Trab_Independente": "tipo_trabalhador_independente", "Tipo_Rep_Fiscal": "tipo_representacao_fiscal",
     "Aplica_PPC": "aplica_ppc", "Aplica_IVA": "aplica_iva", "Aplica_IMI": "aplica_imi",
     "Aplica_IRS": "aplica_irs", "Aplica_SS": "aplica_ss",
-    "IRS_Avulso": "irs_avulso", "Notas": "notas",
+    "IVA_Regime": "iva_regime", "IRS_Avulso": "irs_avulso", "Notas": "notas",
 }
 COLUMN_MAP_FROM_DB = {v: k for k, v in COLUMN_MAP_TO_DB.items()}
 
@@ -258,6 +259,9 @@ def clean_clientes_df(df: pd.DataFrame) -> pd.DataFrame:
     # o que não começar por EN fica PT (a língua por omissão).
     df["Lingua"] = df["Lingua"].str.upper().str[:2]
     df.loc[~df["Lingua"].isin(["PT", "EN"]), "Lingua"] = "PT"
+    # Normaliza o regime de IVA: tudo o que não começar por "M" fica Trimestral.
+    df["IVA_Regime"] = df["IVA_Regime"].str.strip().str.capitalize()
+    df.loc[~df["IVA_Regime"].isin(["Mensal", "Trimestral"]), "IVA_Regime"] = "Trimestral"
     return df[CLIENT_COLS]
 
 
@@ -430,17 +434,21 @@ def registar_log(entry: dict):
 def carregar_config_db():
     client = get_client()
     try:
-        resp = client.table("config").select("params_json, templates_json, templates_irs_json, templates_ss_json").eq("id", 1).execute()
+        resp = client.table("config").select("params_json, templates_json, templates_irs_json, templates_ss_json, templates_extra_json").eq("id", 1).execute()
     except Exception:
-        # A coluna templates_ss_json só existe a partir do v7 — se ainda não
-        # foi corrido, carrega sem ela para a app não deixar de funcionar.
-        resp = client.table("config").select("params_json, templates_json, templates_irs_json").eq("id", 1).execute()
+        try:
+            # Sem a coluna do v8 (templates_extra_json)
+            resp = client.table("config").select("params_json, templates_json, templates_irs_json, templates_ss_json").eq("id", 1).execute()
+        except Exception:
+            # Sem a coluna do v7 (templates_ss_json)
+            resp = client.table("config").select("params_json, templates_json, templates_irs_json").eq("id", 1).execute()
     if not resp.data:
-        return None, None, None, None
+        return None, None, None, None, None
     row = resp.data[0]
     params_json, templates_json = row.get("params_json"), row.get("templates_json")
     templates_irs_json = row.get("templates_irs_json")
     template_ss = row.get("templates_ss_json")
+    templates_extra = row.get("templates_extra_json")
     params, templates, template_irs = None, None, None
     if params_json:
         params = {
@@ -456,11 +464,13 @@ def carregar_config_db():
         templates = {int(k): v for k, v in templates_json.items()}
     if templates_irs_json:
         template_irs = templates_irs_json
-    return params, templates, template_irs, template_ss
+    return params, templates, template_irs, template_ss, templates_extra
 
 
-def guardar_config_db(params: dict, templates: dict, template_irs: dict = None, template_ss: dict = None):
-    """Só o admin tem permissão (RLS) para escrever a configuração global."""
+def guardar_config_db(params: dict, templates: dict, template_irs: dict = None,
+                      template_ss: dict = None, templates_extra: dict = None):
+    """Só o admin tem permissão (RLS) para escrever a configuração global.
+    'templates_extra' = {"iva": {...}, "imi": {...}}."""
     if not sou_admin():
         return
     params_serializ = dict(params)
@@ -472,12 +482,15 @@ def guardar_config_db(params: dict, templates: dict, template_irs: dict = None, 
         registo["templates_irs_json"] = template_irs
     if template_ss is not None:
         registo["templates_ss_json"] = template_ss
+    if templates_extra is not None:
+        registo["templates_extra_json"] = templates_extra
     client = get_client()
     try:
         client.table("config").upsert(registo).execute()
     except Exception:
-        # Sem a coluna do v7 ainda, grava o resto na mesma.
+        # Sem as colunas do v7/v8 ainda, grava o resto na mesma.
         registo.pop("templates_ss_json", None)
+        registo.pop("templates_extra_json", None)
         client.table("config").upsert(registo).execute()
 
 
@@ -491,15 +504,13 @@ def init_state():
         st.session_state.clientes = carregar_clientes_db()
     if "ppc_dados" not in st.session_state:
         st.session_state.ppc_dados = carregar_ppc_db()
-    if "irs_dados" not in st.session_state:
-        st.session_state.irs_dados = carregar_irs_db()
     if "guias_por_associar" not in st.session_state:
         # PDFs de guias PPC carregados cujo nome não tinha NIF — ficam aqui à
         # espera de associação manual; depois de associados vão para o Storage.
         st.session_state.guias_por_associar = {}  # {(n_pag, filename): bytes}
     if ("params" not in st.session_state or "templates" not in st.session_state
             or "template_irs" not in st.session_state or "template_ss" not in st.session_state):
-        params_db, templates_db, template_irs_db, template_ss_db = carregar_config_db()
+        params_db, templates_db, template_irs_db, template_ss_db, templates_extra_db = carregar_config_db()
         if "params" not in st.session_state:
             st.session_state.params = params_db or {
                 "limiar_volume": 500000.0,
@@ -519,6 +530,14 @@ def init_state():
             st.session_state.template_irs = template_irs_db or DEFAULT_TEMPLATE_IRS.copy()
         if "template_ss" not in st.session_state:
             st.session_state.template_ss = template_ss_db or DEFAULT_TEMPLATE_SS.copy()
+        extra = templates_extra_db or {}
+        if "template_iva" not in st.session_state:
+            st.session_state.template_iva = extra.get("iva") or DEFAULT_TEMPLATE_IVA.copy()
+        if "template_imi" not in st.session_state:
+            st.session_state.template_imi = extra.get("imi") or DEFAULT_TEMPLATE_IMI.copy()
+    # O IRS carrega-se DEPOIS dos params, porque depende do "ano dos dados".
+    if "irs_dados" not in st.session_state:
+        st.session_state.irs_dados = carregar_irs_db()
     if "log_envio" not in st.session_state:
         st.session_state.log_envio = carregar_log_db()
 
@@ -1077,9 +1096,22 @@ def clean_irs_df(df: pd.DataFrame) -> pd.DataFrame:
     return df[IRS_COLS]
 
 
-def carregar_irs_db() -> pd.DataFrame:
+def ano_irs_atual() -> int:
+    """O ano de IRS com que a app está a trabalhar = 'ano dos dados' das
+    Configurações. Cada ano tem os seus próprios registos (histórico)."""
+    return int(st.session_state.get("params", {}).get("ano_dados", 2025))
+
+
+def carregar_irs_db(ano: int = None) -> pd.DataFrame:
+    """Carrega só os registos de IRS do ano indicado (histórico por ano)."""
+    if ano is None:
+        ano = ano_irs_atual()
     client = get_client()
-    resp = client.table("irs_dados").select("*").execute()
+    try:
+        resp = client.table("irs_dados").select("*").eq("ano", ano).execute()
+    except Exception:
+        # Antes do v8 não existe a coluna 'ano' — carrega tudo (comportamento antigo).
+        resp = client.table("irs_dados").select("*").execute()
     rows = resp.data or []
     if not rows:
         return pd.DataFrame(columns=IRS_COLS)
@@ -1088,8 +1120,9 @@ def carregar_irs_db() -> pd.DataFrame:
 
 
 def guardar_irs_db(df: pd.DataFrame, nifs_antes: set = None):
-    """Grava por diferença (upsert + apagar só os que desapareceram) — ver nota
-    em guardar_clientes_db."""
+    """Grava por diferença (upsert + apagar só os que desapareceram), sempre
+    dentro do ano de IRS atual — os anos anteriores nunca são tocados."""
+    ano = ano_irs_atual()
     client = get_client()
     df2 = clean_irs_df(df).copy()
     if nifs_antes is None:
@@ -1097,10 +1130,12 @@ def guardar_irs_db(df: pd.DataFrame, nifs_antes: set = None):
         nifs_antes = set(antes["NIF"])
     para_apagar = nifs_antes - set(df2["NIF"])
     if para_apagar:
-        client.table("irs_dados").delete().in_("nif", list(para_apagar)).execute()
+        client.table("irs_dados").delete().eq("ano", ano).in_("nif", list(para_apagar)).execute()
     if not df2.empty:
         registos = df2.rename(columns=IRS_COLUMN_MAP_TO_DB).to_dict("records")
-        client.table("irs_dados").upsert(registos, on_conflict="nif").execute()
+        for r in registos:
+            r["ano"] = ano
+        client.table("irs_dados").upsert(registos, on_conflict="nif,ano").execute()
 
 
 def persistir_irs(df: pd.DataFrame):
@@ -1437,14 +1472,20 @@ def docs_ss_cliente(mes: str, nif: str, guias_set: set, dmrs_set: set, extras_di
     return docs
 
 
-def listar_extras_ss(mes: str) -> dict:
-    """Extras carregados no mês, agrupados por NIF: {nif: [nome1.pdf, ...]}."""
+def listar_extras_generico(pasta: str) -> dict:
+    """Extras carregados numa pasta do Storage (ficheiros 'NIF__nome.pdf'),
+    agrupados por NIF: {nif: [nome1.pdf, ...]}."""
     extras = {}
-    for nome in storage_listar(f"ss/{mes}/extra"):
+    for nome in storage_listar(pasta):
         if "__" in nome:
             nif, nome_ficheiro = nome.split("__", 1)
             extras.setdefault(nif, []).append(nome_ficheiro)
     return extras
+
+
+def listar_extras_ss(mes: str) -> dict:
+    """Extras do mês na Segurança Social: {nif: [nome1.pdf, ...]}."""
+    return listar_extras_generico(f"ss/{mes}/extra")
 
 
 def render_template_ss(template: dict, row: pd.Series, mes: str, docs: list) -> tuple[str, str]:
@@ -1475,3 +1516,213 @@ def render_template_ss(template: dict, row: pd.Series, mes: str, docs: list) -> 
     assunto = texto_template(template, "assunto", lingua).format(**ctx)
     corpo = texto_template(template, "corpo", lingua).format(**ctx)
     return assunto, corpo
+
+
+# ---------------------------------------------------------------------------
+# IVA e IMI — mesmo padrão da Segurança Social: períodos, documentos no
+# Storage e estado de envio por (nif, periodo) nas tabelas iva_dados/imi_dados.
+# Períodos: IVA "2026-M06" (mensal) ou "2026-T2" (trimestral); IMI "2026-P1".
+# Storage: iva/<periodo>/guia|decl|extra/... e imi/<periodo>/guia|extra/...
+# ---------------------------------------------------------------------------
+DEFAULT_TEMPLATE_IVA = {
+    "assunto": "IVA — {periodo_nome} — {nome}",
+    "corpo": (
+        "Exmo(a). Sr(a).,\n\n"
+        "Junto enviamos a documentação do IVA referente a {periodo_nome}: {lista_docs}.\n\n"
+        "O pagamento deverá ser efetuado até {data_limite}.\n\n"
+        "Ficamos ao dispor para qualquer esclarecimento.\n\n"
+        "Com os melhores cumprimentos,"
+    ),
+    "assunto_en": "VAT — {periodo_nome} — {nome}",
+    "corpo_en": (
+        "Dear Sir or Madam,\n\n"
+        "Please find attached the VAT documentation for {periodo_nome}: {lista_docs}.\n\n"
+        "Payment should be made by {data_limite}.\n\n"
+        "We remain at your disposal for any clarification.\n\n"
+        "Best regards,"
+    ),
+}
+
+DEFAULT_TEMPLATE_IMI = {
+    "assunto": "IMI {ano} — {prestacao} — {nome}",
+    "corpo": (
+        "Exmo(a). Sr(a).,\n\n"
+        "Junto enviamos a documentação do IMI de {ano} ({prestacao}): {lista_docs}.\n\n"
+        "O pagamento deverá ser efetuado até {data_limite}.\n\n"
+        "Ficamos ao dispor para qualquer esclarecimento.\n\n"
+        "Com os melhores cumprimentos,"
+    ),
+    "assunto_en": "Municipal Property Tax (IMI) {ano} — {prestacao} — {nome}",
+    "corpo_en": (
+        "Dear Sir or Madam,\n\n"
+        "Please find attached the Municipal Property Tax (IMI) documentation for {ano} ({prestacao}): {lista_docs}.\n\n"
+        "Payment should be made by {data_limite}.\n\n"
+        "We remain at your disposal for any clarification.\n\n"
+        "Best regards,"
+    ),
+}
+
+
+def lista_periodos_iva(regime: str, quantos: int = 12) -> list:
+    """Períodos de IVA disponíveis no seletor, do mais recente para trás."""
+    hoje = date.today()
+    periodos = []
+    if regime == "Mensal":
+        ano, m = hoje.year, hoje.month
+        for _ in range(quantos):
+            periodos.append(f"{ano:04d}-M{m:02d}")
+            m -= 1
+            if m == 0:
+                m, ano = 12, ano - 1
+    else:
+        ano, t = hoje.year, (hoje.month - 1) // 3 + 1
+        for _ in range(quantos):
+            periodos.append(f"{ano:04d}-T{t}")
+            t -= 1
+            if t == 0:
+                t, ano = 4, ano - 1
+    return periodos
+
+
+def nome_periodo_iva(periodo: str, lingua: str = "PT") -> str:
+    ano, codigo = periodo.split("-")
+    if codigo.startswith("M"):
+        return nome_mes(f"{ano}-{codigo[1:]}", lingua)
+    t = int(codigo[1:])
+    return f"Q{t} {ano}" if lingua == "EN" else f"{t}.º trimestre de {ano}"
+
+
+def data_limite_iva(periodo: str) -> date:
+    """Dia 25 do 2.º mês seguinte ao fim do período (mensal e trimestral)."""
+    ano, codigo = periodo.split("-")
+    ano = int(ano)
+    fim_mes = int(codigo[1:]) if codigo.startswith("M") else int(codigo[1:]) * 3
+    m = fim_mes + 2
+    if m > 12:
+        m, ano = m - 12, ano + 1
+    return date(ano, m, 25)
+
+
+PRESTACOES_IMI = {1: "1.ª prestação", 2: "2.ª prestação", 3: "3.ª prestação"}
+PRESTACOES_IMI_EN = {1: "1st instalment", 2: "2nd instalment", 3: "3rd instalment"}
+
+
+def data_limite_imi(ano: int, prestacao: int) -> date:
+    return {1: date(ano, 5, 31), 2: date(ano, 8, 31), 3: date(ano, 11, 30)}[prestacao]
+
+
+def carregar_envios_db(tabela: str, periodo: str) -> dict:
+    """Estado 'email enviado' por NIF num período (tabelas iva_dados/imi_dados)."""
+    try:
+        resp = get_client().table(tabela).select("nif, email_enviado").eq("periodo", periodo).execute()
+        return {r["nif"]: bool(r["email_enviado"]) for r in (resp.data or [])}
+    except Exception:
+        return {}  # tabela ainda não criada (v8 por correr)
+
+
+def marcar_envio_db(tabela: str, nif: str, periodo: str, enviado: bool = True):
+    get_client().table(tabela).upsert(
+        {"nif": nif, "periodo": periodo, "email_enviado": enviado}, on_conflict="nif,periodo"
+    ).execute()
+
+
+def montar_base_iva(regime: str) -> pd.DataFrame:
+    """Clientes com 'Aplica IVA' ligado e o regime escolhido (Mensal/Trimestral)."""
+    clientes = clean_clientes_df(st.session_state.clientes)
+    return clientes[clientes["Aplica_IVA"] & (clientes["IVA_Regime"] == regime)].copy()
+
+
+def montar_base_imi() -> pd.DataFrame:
+    clientes = clean_clientes_df(st.session_state.clientes)
+    return clientes[clientes["Aplica_IMI"]].copy()
+
+
+def render_template_docs(template: dict, row: pd.Series, docs: list, rotulo_principal: tuple, ctx_extra: dict) -> tuple[str, str]:
+    """Render genérico para módulos de documentos (IVA/IMI): 'docs' vem de
+    docs_ss_cliente; 'rotulo_principal' = (nome PT, nome EN) do documento
+    principal (a declaração); 'ctx_extra' são os placeholders do módulo."""
+    lingua = lingua_cliente(row)
+    partes = []
+    for d in docs:
+        if d == "guia":
+            partes.append("payment form" if lingua == "EN" else "guia de pagamento")
+        elif d == "dmr":
+            partes.append(rotulo_principal[1] if lingua == "EN" else rotulo_principal[0])
+        elif d.startswith("extra:"):
+            partes.append(d.split(":", 1)[1])
+    if partes:
+        lista_docs = ", ".join(partes)
+    else:
+        lista_docs = "the attached documents" if lingua == "EN" else "os documentos em anexo"
+
+    ctx = {
+        "nome": row["Nome"],
+        "nif": row["NIF"],
+        "email": row["Email"],
+        "lista_docs": lista_docs,
+    }
+    ctx.update(ctx_extra)
+    assunto = texto_template(template, "assunto", lingua).format(**ctx)
+    corpo = texto_template(template, "corpo", lingua).format(**ctx)
+    return assunto, corpo
+
+
+def gerar_excel_estado_mensal(titulo: str, base: pd.DataFrame, guias_set: set,
+                              decl_set: set, extras_dict: dict, enviados: dict,
+                              rotulo_decl: str = "DMR/DRI") -> bytes:
+    """Folha de controlo dos módulos de documentos (SS/IVA/IMI): quem tem
+    documentos carregados e quem já recebeu o email."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Controlo"
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A5"
+
+    FONT = "Arial"
+    HEADER_FILL = PatternFill("solid", start_color="1F4E78", end_color="1F4E78")
+    ENVIADO_FILL = PatternFill("solid", start_color="E2EFDA", end_color="E2EFDA")
+    HEADER_FONT = Font(name=FONT, color="FFFFFF", bold=True, size=10)
+    TITLE_FONT = Font(name=FONT, bold=True, size=14, color="1F4E78")
+    BLACK = Font(name=FONT, color="000000")
+    thin = Side(style="thin", color="BFBFBF")
+    BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws["A1"] = titulo
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:E1")
+
+    headers = ["N.º", "NIF", "Nome", "Email", "Língua", "Guia", rotulo_decl, "Extras", "Email Enviado"]
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=4, column=i, value=h)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = BORDER
+    ws.row_dimensions[4].height = 30
+
+    widths = [9, 12, 30, 26, 8, 9, 11, 9, 13]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    row = 5
+    for _, r in base.iterrows():
+        nif = r["NIF"]
+        vals = [
+            r.get("Numero_Cliente", ""), nif, r["Nome"], r["Email"], r.get("Lingua", "PT"),
+            "Sim" if nif in guias_set else "Não",
+            "Sim" if nif in decl_set else "Não",
+            len(extras_dict.get(nif, [])),
+            "Sim" if enviados.get(nif, False) else "Não",
+        ]
+        for i, v in enumerate(vals, start=1):
+            c = ws.cell(row=row, column=i, value=v)
+            c.font = BLACK
+            c.border = BORDER
+        if enviados.get(nif, False):
+            for i in range(1, len(vals) + 1):
+                ws.cell(row=row, column=i).fill = ENVIADO_FILL
+        row += 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
