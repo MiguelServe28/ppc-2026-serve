@@ -27,7 +27,6 @@ from common import (
     montar_base_imi,
     registar_log,
     render_template_docs,
-    sou_admin,
     storage_download_pdf,
     storage_listar,
     storage_upload_pdf,
@@ -271,13 +270,8 @@ with tab_emails:
 # --- Template ----------------------------------------------------------------
 with tab_template:
     st.subheader("Template do Email do IMI")
-    if sou_admin():
-        editor_template_bilingue(st.session_state.template_imi, "imi_tpl")
-        st.caption("Placeholders disponíveis: {nome} {nif} {email} {ano} {prestacao} {data_limite} {lista_docs}.")
-    else:
-        st.caption("O template de email é definido pelo administrador.")
-        st.text_input("Assunto (PT)", value=st.session_state.template_imi.get("assunto", ""), disabled=True)
-        st.text_area("Corpo (PT)", value=st.session_state.template_imi.get("corpo", ""), height=260, disabled=True)
+    editor_template_bilingue(st.session_state.template_imi, "imi_tpl")
+    st.caption("Placeholders disponíveis: {nome} {nif} {email} {ano} {prestacao} {data_limite} {lista_docs}. Alterações aqui ficam guardadas para toda a equipa.")
 
 guardar_config_db(
     st.session_state.params, st.session_state.templates,
