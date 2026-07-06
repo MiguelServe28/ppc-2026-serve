@@ -58,6 +58,8 @@ mes = st.selectbox(
 # Estado deste mês (uma leitura por tipo de documento + estado de envio)
 dmrs_set = {n[:-4] for n in storage_listar(f"ss/{mes}/dmr") if n.lower().endswith(".pdf")}
 dris_set = {n[:-4] for n in storage_listar(f"ss/{mes}/dri") if n.lower().endswith(".pdf")}
+retencoes_set = {n[:-4] for n in storage_listar(f"ss/{mes}/retencoes") if n.lower().endswith(".pdf")}
+iuc_set = {n[:-4] for n in storage_listar(f"ss/{mes}/iuc") if n.lower().endswith(".pdf")}
 extras_dict = listar_extras_ss(mes)
 enviados = carregar_ss_mes_db(mes)
 
@@ -77,13 +79,18 @@ with tab_docs:
     st.markdown("**Carregamento em massa** (vários PDFs de uma vez, com o NIF no nome do ficheiro)")
     col_tipo, col_up = st.columns([1, 3])
     with col_tipo:
-        tipo_doc = st.radio("Tipo de documento", ["DMR", "DRI", "Outros documentos"], key="ss_tipo_doc")
+        tipo_doc = st.radio(
+            "Tipo de documento",
+            ["DMR", "DRI", "Retenções", "IUC", "Outros documentos"],
+            key="ss_tipo_doc",
+        )
     with col_up:
         up_massa = st.file_uploader(
             "Carregar PDFs (nome a começar pelo NIF de 9 dígitos — o resto do nome pode ser "
             "o que quiseres, ex: '267894449_IUC.pdf', para depois identificares o documento)",
             type=["pdf"], accept_multiple_files=True, key="ss_up_massa",
         )
+    PASTAS_TIPO_DOC = {"DMR": "dmr", "DRI": "dri", "Retenções": "retencoes", "IUC": "iuc"}
     if up_massa:
         ids_upload = tuple(sorted(f"{f.name}_{f.size}" for f in up_massa))
         if st.session_state.get("_ss_massa_proc") != (mes, tipo_doc, ids_upload):
@@ -98,8 +105,7 @@ with tab_docs:
                     label = extrair_label_extra(f.name, nif_d)
                     storage_upload_pdf(f"ss/{mes}/extra/{nif_d}__{label}", f.getvalue())
                 else:
-                    pasta = "dmr" if tipo_doc == "DMR" else "dri"
-                    storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_d}.pdf", f.getvalue())
+                    storage_upload_pdf(f"ss/{mes}/{PASTAS_TIPO_DOC[tipo_doc]}/{nif_d}.pdf", f.getvalue())
                 ok += 1
             msg = f"{ok} ficheiro(s) associados e guardados no arquivo."
             if sem_nif:
@@ -115,31 +121,30 @@ with tab_docs:
         format_func=lambda n: f"{n} — {base_ss.loc[base_ss['NIF']==n,'Nome'].values[0]}",
         key="ss_cliente_doc",
     )
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        up_dmr = st.file_uploader("DMR (PDF)", type=["pdf"], key=f"ss_up_dmr_{mes}_{nif_doc}")
-        if up_dmr is not None:
-            fid = f"{up_dmr.name}_{up_dmr.size}"
-            if st.session_state.get(f"_ss_dmr_proc_{mes}_{nif_doc}") != fid:
-                storage_upload_pdf(f"ss/{mes}/dmr/{nif_doc}.pdf", up_dmr.getvalue())
-                st.session_state[f"_ss_dmr_proc_{mes}_{nif_doc}"] = fid
-                dmrs_set.add(nif_doc)
-        st.caption("✅ DMR no arquivo" if nif_doc in dmrs_set else "❌ Sem DMR")
-    with c2:
-        up_dri = st.file_uploader("DRI (PDF)", type=["pdf"], key=f"ss_up_dri_{mes}_{nif_doc}")
-        if up_dri is not None:
-            fid = f"{up_dri.name}_{up_dri.size}"
-            if st.session_state.get(f"_ss_dri_proc_{mes}_{nif_doc}") != fid:
-                storage_upload_pdf(f"ss/{mes}/dri/{nif_doc}.pdf", up_dri.getvalue())
-                st.session_state[f"_ss_dri_proc_{mes}_{nif_doc}"] = fid
-                dris_set.add(nif_doc)
-        st.caption("✅ DRI no arquivo" if nif_doc in dris_set else "❌ Sem DRI")
-    with c3:
+    def _uploader_simples(col, rotulo: str, pasta: str, conjunto: set):
+        """Upload de 1 documento por cliente/mês para uma categoria fixa (DMR,
+        DRI, Retenções, IUC) — evita repetir a mesma lógica 4 vezes."""
+        with col:
+            up = st.file_uploader(f"{rotulo} (PDF)", type=["pdf"], key=f"ss_up_{pasta}_{mes}_{nif_doc}")
+            if up is not None:
+                fid = f"{up.name}_{up.size}"
+                if st.session_state.get(f"_ss_{pasta}_proc_{mes}_{nif_doc}") != fid:
+                    storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_doc}.pdf", up.getvalue())
+                    st.session_state[f"_ss_{pasta}_proc_{mes}_{nif_doc}"] = fid
+                    conjunto.add(nif_doc)
+            st.caption(f"✅ {rotulo} no arquivo" if nif_doc in conjunto else f"❌ Sem {rotulo}")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    _uploader_simples(c1, "DMR", "dmr", dmrs_set)
+    _uploader_simples(c2, "DRI", "dri", dris_set)
+    _uploader_simples(c3, "Retenções", "retencoes", retencoes_set)
+    _uploader_simples(c4, "IUC", "iuc", iuc_set)
+    with c5:
         up_extras = st.file_uploader(
             "Outros documentos (PDF, opcional)", type=["pdf"],
             accept_multiple_files=True, key=f"ss_up_extra_{mes}_{nif_doc}",
-            help="Ex: IUC, retenções, ou outro pagamento que queiras aproveitar para enviar no mesmo "
-                 "email deste mês. O nome do ficheiro (ex: 'IUC.pdf') é usado para identificar o documento.",
+            help="Para qualquer outro pagamento que queiras aproveitar para enviar no mesmo email deste "
+                 "mês. O nome do ficheiro (ex: 'Contribuição Extra.pdf') é usado para identificar o documento.",
         )
         if up_extras:
             ids_extras = tuple(sorted(f"{f.name}_{f.size}" for f in up_extras))
@@ -160,6 +165,8 @@ with tab_docs:
             "N.º": r.get("Numero_Cliente", ""), "NIF": r["NIF"], "Nome": r["Nome"],
             "DMR": "✅" if r["NIF"] in dmrs_set else "❌",
             "DRI": "✅" if r["NIF"] in dris_set else "❌",
+            "Retenções": "✅" if r["NIF"] in retencoes_set else "❌",
+            "IUC": "✅" if r["NIF"] in iuc_set else "❌",
             "Extras": len(extras_dict.get(r["NIF"], [])),
             "Email Enviado": bool(r["Email_Enviado"]),
         })
@@ -169,7 +176,7 @@ with tab_docs:
         use_container_width=True,
         hide_index=True,
         height=360,
-        disabled=["N.º", "NIF", "Nome", "DMR", "DRI", "Extras"],
+        disabled=["N.º", "NIF", "Nome", "DMR", "DRI", "Retenções", "IUC", "Extras"],
         column_config={"Email Enviado": st.column_config.CheckboxColumn("Email Enviado")},
         key=f"ss_estado_{mes}",
     )
@@ -183,6 +190,7 @@ with tab_docs:
     excel_ss = gerar_excel_estado_mensal(
         f"Controlo Segurança Social — {nome_mes(mes)}", base_ss, dmrs_set, dris_set, extras_dict, enviados,
         rotulo_guia="DMR", rotulo_decl="DRI",
+        extra_categorias=[("Retenções", retencoes_set), ("IUC", iuc_set)],
     )
     st.download_button(
         "⬇️ Descarregar Excel de Controlo (SS)", excel_ss,
@@ -201,7 +209,10 @@ with tab_emails:
 
     tpl = st.session_state.template_ss
 
-    com_docs = [n for n in elegiveis["NIF"] if n in dmrs_set or n in dris_set or n in extras_dict]
+    com_docs = [
+        n for n in elegiveis["NIF"]
+        if n in dmrs_set or n in dris_set or n in retencoes_set or n in iuc_set or n in extras_dict
+    ]
     nao_enviados = [n for n in elegiveis["NIF"] if not enviados.get(n, False)]
 
     preview_nif = st.selectbox(
@@ -212,7 +223,7 @@ with tab_emails:
     )
     if preview_nif:
         row = elegiveis[elegiveis["NIF"] == preview_nif].iloc[0]
-        docs = obter_documentos_ss(mes, preview_nif, dmrs_set, dris_set, extras_dict)
+        docs = obter_documentos_ss(mes, preview_nif, dmrs_set, dris_set, retencoes_set, iuc_set, extras_dict)
         _, valores_prev = carregar_anexos_e_valores_ss(docs) if docs else ([], [])
         assunto, corpo = render_template_ss(tpl, row, mes, docs, valores_prev)
         st.text_input("Assunto (preview)", value=assunto, disabled=True)
@@ -270,7 +281,7 @@ with tab_emails:
             sucessos, falhas = 0, 0
             for i, nif in enumerate(selecionados):
                 row = elegiveis[elegiveis["NIF"] == nif].iloc[0]
-                docs = obter_documentos_ss(mes, nif, dmrs_set, dris_set, extras_dict)
+                docs = obter_documentos_ss(mes, nif, dmrs_set, dris_set, retencoes_set, iuc_set, extras_dict)
                 anexos, valores = carregar_anexos_e_valores_ss(docs)
                 assunto, corpo = render_template_ss(tpl, row, mes, docs, valores)
                 try:
