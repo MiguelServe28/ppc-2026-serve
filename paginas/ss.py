@@ -16,6 +16,7 @@ from common import (
     data_limite_ss,
     docs_ss_cliente,
     editor_template_bilingue,
+    gerar_excel_estado_mensal,
     enviar_email,
     escolher_conta_email,
     extrair_nif_de_filename,
@@ -170,6 +171,16 @@ with tab_docs:
                 marcar_ss_enviado_db(r["NIF"], mes, bool(r["Email Enviado"]))
         st.success("Estado guardado.")
         st.rerun()
+
+    excel_ss = gerar_excel_estado_mensal(
+        f"Controlo Segurança Social — {nome_mes(mes)}", base_ss, guias_set, dmrs_set, extras_dict, enviados,
+        rotulo_decl="DMR/DRI",
+    )
+    st.download_button(
+        "⬇️ Descarregar Excel de Controlo (SS)", excel_ss,
+        file_name=f"Controlo_SS_{mes}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # --- Emails ------------------------------------------------------------------
 with tab_emails:
