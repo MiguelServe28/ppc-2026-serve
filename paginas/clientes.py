@@ -135,6 +135,7 @@ st.markdown("**Tabela de clientes** — pode editar diretamente, adicionar ou ap
 col_config = {
     "Numero_Cliente": st.column_config.TextColumn("N.º"),
     "Lingua": st.column_config.SelectboxColumn("Língua", options=["PT", "EN"], help="Os emails deste cliente são enviados nesta língua (em todos os módulos)."),
+    "IVA_Regime": st.column_config.SelectboxColumn("Regime IVA", options=["Trimestral", "Mensal"], help="Define em que períodos este cliente aparece na página do IVA."),
     "IRS_Avulso": st.column_config.CheckboxColumn("Só IRS (avulso)", help="Cliente importado apenas pelo menu do IRS — não é cliente de avença."),
     "Tipo_Empresa": st.column_config.CheckboxColumn("Empresa"),
     "Tipo_AL": st.column_config.CheckboxColumn("Aloj. Local"),
