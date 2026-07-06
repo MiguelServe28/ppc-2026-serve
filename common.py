@@ -1431,9 +1431,9 @@ def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
 # ---------------------------------------------------------------------------
 # Segurança Social (DMR/DRI) — envio mensal de declarações e guias.
 # Estado "email enviado" guardado por cliente e por mês na tabela ss_dados.
-# Documentos no Storage: ss/<mes>/dmr/<nif>.pdf, ss/<mes>/dri/<nif>.pdf,
-# ss/<mes>/retencoes/<nif>.pdf, ss/<mes>/iuc/<nif>.pdf, e outros avulsos em
-# ss/<mes>/extra/<nif>__<nome do ficheiro>.
+# Documentos no Storage: ss/<mes>/<categoria>/<nif>__<nome do ficheiro>, onde
+# <categoria> é dmr, dri, retencoes, iuc ou extra — todas suportam MAIS DO QUE
+# UM ficheiro por cliente/mês (ex: 2 DMRs do mesmo cliente).
 # ---------------------------------------------------------------------------
 MESES_PT = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
             "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
@@ -1514,27 +1514,29 @@ def montar_base_ss() -> pd.DataFrame:
     return clientes[clientes["Aplica_SS"]].copy()
 
 
-def obter_documentos_ss(mes: str, nif: str, dmrs_set: set, dris_set: set,
-                         retencoes_set: set, iuc_set: set, extras_dict: dict) -> list:
-    """Lista dos documentos disponíveis para um cliente neste mês, a partir dos
-    conjuntos já lidos do Storage (para não fazer chamadas a mais). Devolve uma
-    lista de dicts {tipo, caminho, anexo} — 'tipo' é a etiqueta usada no email
-    e no Excel (DMR, DRI, Retenções, IUC, ou o nome do documento extra)."""
+def obter_documentos_ss(mes: str, nif: str, dmrs_dict: dict, dris_dict: dict,
+                         retencoes_dict: dict, iuc_dict: dict, extras_dict: dict) -> list:
+    """Lista dos documentos disponíveis para um cliente neste mês. DMR, DRI,
+    Retenções e IUC agora suportam MAIS DO QUE UM ficheiro por cliente (ex: o
+    cliente envia 2 DMRs) — cada categoria é um dict {nif: [nome1, nome2, ...]},
+    tal como os extras. Devolve uma lista de dicts {tipo, caminho, anexo} —
+    'tipo' é a etiqueta usada no email e no Excel; quando há mais do que um
+    ficheiro na mesma categoria, a etiqueta inclui o nome para os distinguir
+    (ex: 'DMR (Entidade B)')."""
     docs = []
-    if nif in dmrs_set:
-        docs.append({"tipo": "DMR", "caminho": f"ss/{mes}/dmr/{nif}.pdf", "anexo": f"DMR_{mes}_{nif}.pdf"})
-    if nif in dris_set:
-        docs.append({"tipo": "DRI", "caminho": f"ss/{mes}/dri/{nif}.pdf", "anexo": f"DRI_{mes}_{nif}.pdf"})
-    if nif in retencoes_set:
-        docs.append({"tipo": "Retenções", "caminho": f"ss/{mes}/retencoes/{nif}.pdf", "anexo": f"Retencoes_{mes}_{nif}.pdf"})
-    if nif in iuc_set:
-        docs.append({"tipo": "IUC", "caminho": f"ss/{mes}/iuc/{nif}.pdf", "anexo": f"IUC_{mes}_{nif}.pdf"})
+    categorias = [
+        ("DMR", "dmr", dmrs_dict), ("DRI", "dri", dris_dict),
+        ("Retenções", "retencoes", retencoes_dict), ("IUC", "iuc", iuc_dict),
+    ]
+    for rotulo, pasta, dicionario in categorias:
+        nomes = dicionario.get(nif, [])
+        for nome in nomes:
+            base = nome.rsplit(".", 1)[0] if "." in nome else nome
+            tipo = rotulo if (len(nomes) == 1 or base.lower() == rotulo.lower()) else f"{rotulo} ({base})"
+            docs.append({"tipo": tipo, "caminho": f"ss/{mes}/{pasta}/{nif}__{nome}", "anexo": nome})
     for nome_extra in extras_dict.get(nif, []):
-        docs.append({
-            "tipo": nome_extra.rsplit(".", 1)[0] if "." in nome_extra else nome_extra,
-            "caminho": f"ss/{mes}/extra/{nif}__{nome_extra}",
-            "anexo": nome_extra,
-        })
+        base = nome_extra.rsplit(".", 1)[0] if "." in nome_extra else nome_extra
+        docs.append({"tipo": base, "caminho": f"ss/{mes}/extra/{nif}__{nome_extra}", "anexo": nome_extra})
     return docs
 
 
