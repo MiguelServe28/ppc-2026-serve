@@ -597,6 +597,13 @@ def ler_ficheiro_importacao(uploaded_file) -> pd.DataFrame:
     for c in df.columns:
         if c in ("N.º", "Nº", "N.o", "N°", "No.", "Numero", "Número", "Num", "Numero_Cliente", "N.º Cliente"):
             aliases[c] = "Numero_Cliente"
+    # Nome/email do gestor — aceita tanto "Gestor_Nome"/"Gestor_Email" como as
+    # versões mais simples do template ("Gestor"/"Email Gestor").
+    for c in df.columns:
+        if c in ("Gestor", "Gestor_Nome", "Nome Gestor", "Nome do Gestor"):
+            aliases[c] = "Gestor_Nome"
+        elif c in ("Email Gestor", "Gestor_Email", "Email do Gestor", "Gestor Email"):
+            aliases[c] = "Gestor_Email"
     df = df.rename(columns=aliases)
     if "Numero_Cliente" in df.columns:
         df["Numero_Cliente"] = (
