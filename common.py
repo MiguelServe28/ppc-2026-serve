@@ -12,6 +12,7 @@ import math
 import re
 import smtplib
 import ssl
+import unicodedata
 from datetime import date
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -314,6 +315,7 @@ def guardar_clientes_db(df: pd.DataFrame, nifs_antes: set = None):
     if para_apagar:
         client.table("clientes").delete().in_("nif", list(para_apagar)).execute()
     if not df2.empty:
+        df2 = df2.drop_duplicates(subset="NIF", keep="last")
         registos = df2.rename(columns=COLUMN_MAP_TO_DB).to_dict("records")
         client.table("clientes").upsert(registos, on_conflict="nif").execute()
 
@@ -349,6 +351,7 @@ def guardar_clientes_parcial_db(df_editado: pd.DataFrame, nifs_visiveis_antes: s
     if nifs_para_apagar:
         client.table("clientes").delete().in_("nif", list(nifs_para_apagar)).execute()
     if not df2.empty:
+        df2 = df2.drop_duplicates(subset="NIF", keep="last")
         registos = df2.rename(columns=COLUMN_MAP_TO_DB).to_dict("records")
         client.table("clientes").upsert(registos, on_conflict="nif").execute()
     return df2
@@ -837,17 +840,61 @@ def extrair_nif_de_filename(filename: str):
     return m.group(1) if m else None
 
 
+def sanitizar_nome_ficheiro(nome: str) -> str:
+    """Torna um nome de ficheiro seguro para usar como chave no Supabase
+    Storage (que rejeita espaços, acentos e outros caracteres especiais —
+    ex: 'Maio - citação.pdf' dava erro 'Invalid key'). Remove acentos,
+    troca tudo o que não seja letra/número/-/_ por '_' e mantém a extensão."""
+    if not nome:
+        return "documento.pdf"
+    base, ponto, ext = nome.rpartition(".")
+    if not ponto:
+        base, ext = nome, "pdf"
+    base = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^A-Za-z0-9\-_]+", "_", base).strip("_")
+    if not base:
+        base = "documento"
+    ext = re.sub(r"[^A-Za-z0-9]", "", ext).lower() or "pdf"
+    return f"{base}.{ext}"
+
+
+def nomes_ficheiro_unicos(nomes: list) -> list:
+    """Garante que não há nomes repetidos dentro do MESMO carregamento —
+    importante porque dois ficheiros com o mesmo nome (ex: duas DMRs ambas
+    chamadas '515907529.pdf') dariam o mesmo caminho no Storage e o segundo
+    ficheiro substituiria o primeiro silenciosamente. Aqui, ao segundo nome
+    igual junta-se '_2', ao terceiro '_3', etc. Mantém a ordem da lista."""
+    contagem = {}
+    resultado = []
+    for nome in nomes:
+        if nome not in contagem:
+            contagem[nome] = 0
+            resultado.append(nome)
+            continue
+        contagem[nome] += 1
+        base, ponto, ext = nome.rpartition(".")
+        if not ponto:
+            base, ext = nome, "pdf"
+        novo = f"{base}_{contagem[nome] + 1}.{ext}"
+        while novo in contagem:
+            contagem[nome] += 1
+            novo = f"{base}_{contagem[nome] + 1}.{ext}"
+        contagem[novo] = 0
+        resultado.append(novo)
+    return resultado
+
+
 def extrair_label_extra(filename: str, nif: str) -> str:
     """Para os 'outros documentos' carregados em massa: o nome do ficheiro deve
     começar pelo NIF, mas o resto pode ser o que quiseres (ex: '267894449_IUC.pdf',
-    '267894449 - Retenções.pdf'). Isto devolve só a parte depois do NIF, para
-    conseguires identificar de que documento se trata (ex: 'IUC.pdf')."""
+    '267894449 - Retenções.pdf'). Isto devolve só a parte depois do NIF, já
+    tornada segura para o Storage (ex: 'IUC.pdf' ou 'Retencoes.pdf')."""
     resto = filename.replace(nif, "", 1).strip(" -_")
     if not resto or resto.lower() in (".pdf", "pdf"):
         return "Documento.pdf"
     if not resto.lower().endswith(".pdf"):
         resto += ".pdf"
-    return resto
+    return sanitizar_nome_ficheiro(resto)
 
 
 # Padrões de valor mais comuns em guias/documentos de pagamento portugueses —
@@ -1512,6 +1559,21 @@ def montar_base_ss() -> pd.DataFrame:
     """Clientes com 'Aplica SS' ligado (o estado por mês junta-se na página)."""
     clientes = clean_clientes_df(st.session_state.clientes)
     return clientes[clientes["Aplica_SS"]].copy()
+
+
+def docs_ss_cliente(periodo: str, nif: str, guias_set: set, decl_set: set, extras_dict: dict) -> list:
+    """Versão genérica e mais simples, usada pelos módulos IVA e IMI
+    (render_template_docs): devolve etiquetas em texto simples ('guia', 'dmr',
+    'extra:nome') em vez da lista de dicts mais rica do SS. Mantida à parte de
+    obter_documentos_ss porque IVA/IMI só têm 1 ficheiro por categoria."""
+    docs = []
+    if nif in guias_set:
+        docs.append("guia")
+    if nif in decl_set:
+        docs.append("dmr")
+    for nome_extra in extras_dict.get(nif, []):
+        docs.append(f"extra:{nome_extra}")
+    return docs
 
 
 def obter_documentos_ss(mes: str, nif: str, dmrs_dict: dict, dris_dict: dict,
