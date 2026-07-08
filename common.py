@@ -304,9 +304,14 @@ def guardar_clientes_db(df: pd.DataFrame, nifs_antes: set = None):
     df2 = clean_clientes_df(df).copy()
 
     if not sou_admin():
-        df2["Gestor_Email"] = meu_email()
+        # Só preenche o gestor em clientes NOVOS (sem gestor definido) — nunca
+        # reatribui um cliente já existente doutro gestor (a base é partilhada
+        # e visível a todos desde a v9, mas a "posse" de cada cliente não muda
+        # só por outro utilizador gravar a tabela).
+        sem_gestor = df2["Gestor_Email"].astype(str).str.strip() == ""
+        df2.loc[sem_gestor, "Gestor_Email"] = meu_email()
         if not perfil_nome_vazio():
-            df2["Gestor_Nome"] = st.session_state.perfil["nome"]
+            df2.loc[sem_gestor, "Gestor_Nome"] = st.session_state.perfil["nome"]
 
     if nifs_antes is None:
         antes = clean_clientes_df(st.session_state.get("clientes", pd.DataFrame(columns=CLIENT_COLS)))
@@ -326,9 +331,10 @@ def persistir_clientes(df: pd.DataFrame):
     forma segura (por diferença)."""
     df = clean_clientes_df(df)
     if not sou_admin():
-        df["Gestor_Email"] = meu_email()
+        sem_gestor = df["Gestor_Email"].astype(str).str.strip() == ""
+        df.loc[sem_gestor, "Gestor_Email"] = meu_email()
         if not perfil_nome_vazio():
-            df["Gestor_Nome"] = st.session_state.perfil["nome"]
+            df.loc[sem_gestor, "Gestor_Nome"] = st.session_state.perfil["nome"]
     antes = clean_clientes_df(st.session_state.get("clientes", pd.DataFrame(columns=CLIENT_COLS)))
     guardar_clientes_db(df, nifs_antes=set(antes["NIF"]))
     st.session_state.clientes = df
@@ -342,9 +348,10 @@ def guardar_clientes_parcial_db(df_editado: pd.DataFrame, nifs_visiveis_antes: s
     client = get_client()
     df2 = clean_clientes_df(df_editado).copy()
     if not sou_admin():
-        df2["Gestor_Email"] = meu_email()
+        sem_gestor = df2["Gestor_Email"].astype(str).str.strip() == ""
+        df2.loc[sem_gestor, "Gestor_Email"] = meu_email()
         if not perfil_nome_vazio():
-            df2["Gestor_Nome"] = st.session_state.perfil["nome"]
+            df2.loc[sem_gestor, "Gestor_Nome"] = st.session_state.perfil["nome"]
 
     nifs_finais = set(df2["NIF"])
     nifs_para_apagar = nifs_visiveis_antes - nifs_finais
@@ -790,13 +797,17 @@ def editor_template_bilingue(tpl: dict, prefixo_key: str, altura: int = 260):
         st.caption("Se deixares a versão EN vazia, os clientes EN recebem a versão PT.")
 
 
-def enviar_email(smtp_cfg, destinatario, assunto, corpo, anexos, cc=None, assinatura_html=""):
+def enviar_email(smtp_cfg, destinatario, assunto, corpo, anexos, cc=None, bcc=None, assinatura_html=""):
     """Envia o email em texto E em HTML (multipart/alternative): quem abre num
     cliente moderno vê a versão HTML (com a assinatura da SERVE, se definida em
-    Configurações); os restantes veem o texto simples."""
+    Configurações); os restantes veem o texto simples. 'bcc' vai só no envelope
+    (nunca aparece nos cabeçalhos, como é normal em BCC) — usado para a conta
+    que enviou receber sempre uma cópia, sem aparecer para o cliente nem CC."""
     import html as html_mod
 
     cc_list = [e.strip() for e in (cc or []) if e and e.strip()]
+    ja_incluidos = {destinatario.strip().lower()} | {e.lower() for e in cc_list}
+    bcc_list = [e.strip() for e in (bcc or []) if e and e.strip() and e.strip().lower() not in ja_incluidos]
 
     msg = MIMEMultipart("mixed")
     msg["From"] = smtp_cfg["remetente"]
@@ -821,7 +832,7 @@ def enviar_email(smtp_cfg, destinatario, assunto, corpo, anexos, cc=None, assina
         part["Content-Disposition"] = f'attachment; filename="{filename}"'
         msg.attach(part)
 
-    todos_destinatarios = [destinatario] + cc_list
+    todos_destinatarios = [destinatario] + cc_list + bcc_list
 
     context = ssl.create_default_context()
     if smtp_cfg["tls"]:
