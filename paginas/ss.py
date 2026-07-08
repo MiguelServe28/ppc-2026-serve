@@ -146,6 +146,17 @@ with tab_docs:
         format_func=lambda n: f"{n} — {base_ss.loc[base_ss['NIF']==n,'Nome'].values[0]}",
         key="ss_cliente_doc",
     )
+    total_docs_cliente = sum(len(d.get(nif_doc, [])) for d in DICIONARIOS_PASTA.values())
+    if total_docs_cliente:
+        with st.expander(f"🗑️ Apagar todos os documentos deste cliente neste mês ({total_docs_cliente})"):
+            st.caption("Apaga TODOS os documentos (DMR, DRI, Retenções, IUC e Outros) deste cliente, só para este mês. Útil para limpar testes antes de um envio real.")
+            if st.button("Confirmar — apagar tudo", key=f"ss_apagar_tudo_{mes}_{nif_doc}", type="primary"):
+                for pasta_x, dic_x in DICIONARIOS_PASTA.items():
+                    for nome_x in dic_x.get(nif_doc, []):
+                        storage_apagar(f"ss/{mes}/{pasta_x}/{nif_doc}__{nome_x}")
+                st.success("Documentos apagados.")
+                st.rerun()
+
     def _gestor_documentos(col, rotulo: str, pasta: str, dicionario: dict, opcional: bool = False):
         """Upload (aceita vários ficheiros) + lista com botão de apagar, para
         uma categoria de documento (DMR, DRI, Retenções, IUC ou Outros) de um
