@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from common import (
+    DEFAULT_TEMPLATE_SS,
     carregar_anexos_e_valores_ss,
     carregar_ss_mes_db,
     data_limite_ss,
@@ -81,7 +82,12 @@ with tab_docs:
     )
 
     st.markdown("**Carregamento em massa** (vários PDFs de uma vez, com o NIF no nome do ficheiro)")
-    st.caption("Se um cliente tiver 2 documentos da mesma categoria, distingue-os no nome do ficheiro (ex: '267894449_Entidade A.pdf').")
+    st.caption(
+        "Para DMR, DRI, Retenções e IUC: carregar um novo ficheiro para um cliente SUBSTITUI o que "
+        "lá estava (não precisas de apagar antes de corrigir/reenviar). Se quiseres mesmo mais do que "
+        "um do mesmo tipo para o mesmo cliente, carrega-os todos DE UMA VEZ (ficam numerados). "
+        "Em 'Outros documentos' cada nome de ficheiro fica guardado à parte (não substitui os outros)."
+    )
     col_tipo, col_up = st.columns([1, 3])
     with col_tipo:
         tipo_doc = st.radio(
@@ -91,37 +97,42 @@ with tab_docs:
         )
     with col_up:
         up_massa = st.file_uploader(
-            "Carregar PDFs (nome a começar pelo NIF de 9 dígitos — o resto do nome pode ser "
-            "o que quiseres, ex: '267894449_IUC.pdf', para depois identificares o documento)",
+            "Carregar PDFs (nome a começar pelo NIF de 9 dígitos — em 'Outros documentos' o resto "
+            "do nome identifica o documento, ex: '267894449_IUC.pdf')",
             type=["pdf"], accept_multiple_files=True, key="ss_up_massa",
         )
     PASTAS_TIPO_DOC = {"DMR": "dmr", "DRI": "dri", "Retenções": "retencoes", "IUC": "iuc", "Outros documentos": "extra"}
+    DICIONARIOS_PASTA = {"dmr": dmrs_dict, "dri": dris_dict, "retencoes": retencoes_dict,
+                          "iuc": iuc_dict, "extra": extras_dict}
     if up_massa:
         ids_upload = tuple(sorted(f"{f.name}_{f.size}" for f in up_massa))
         if st.session_state.get("_ss_massa_proc") != (mes, tipo_doc, ids_upload):
             st.session_state["_ss_massa_proc"] = (mes, tipo_doc, ids_upload)
             pasta = PASTAS_TIPO_DOC[tipo_doc]
+            fixo = pasta != "extra"  # DMR/DRI/Retenções/IUC: nome fixo -> substitui; extras: aditivo
             ok, sem_nif = 0, []
-            itens = []  # (ficheiro, nif) por ordem, para depois desambiguar nomes repetidos
-            labels_por_nif = {}
+            ficheiros_por_nif = {}
             for f in up_massa:
                 nif_d = extrair_nif_de_filename(f.name)
                 if not nif_d:
                     sem_nif.append(f.name)
                     continue
-                label = extrair_label_extra(f.name, nif_d)
-                if tipo_doc != "Outros documentos" and label == "Documento.pdf":
-                    label = f"{tipo_doc}.pdf"  # só veio o NIF no nome -> usa o próprio tipo como etiqueta
-                itens.append((f, nif_d))
-                labels_por_nif.setdefault(nif_d, []).append(label)
-            # Se dois ficheiros do MESMO cliente derem o mesmo nome (ex: duas DMRs
-            # ambas só com o NIF no nome), desambigua-se para nenhum se perder.
-            labels_unicos_por_nif = {nif: iter(nomes_ficheiro_unicos(labels)) for nif, labels in labels_por_nif.items()}
-            for f, nif_d in itens:
-                label = next(labels_unicos_por_nif[nif_d])
-                storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_d}__{label}", f.getvalue())
-                ok += 1
+                ficheiros_por_nif.setdefault(nif_d, []).append(f)
+            for nif_d, ficheiros in ficheiros_por_nif.items():
+                if fixo:
+                    for nome_antigo in DICIONARIOS_PASTA[pasta].get(nif_d, []):
+                        storage_apagar(f"ss/{mes}/{pasta}/{nif_d}__{nome_antigo}")
+                    nomes_novos = ([f"{pasta}.pdf"] if len(ficheiros) == 1
+                                    else [f"{pasta}_{i}.pdf" for i in range(1, len(ficheiros) + 1)])
+                else:
+                    labels = [extrair_label_extra(f.name, nif_d) for f in ficheiros]
+                    nomes_novos = nomes_ficheiro_unicos(labels)
+                for f, nome_novo in zip(ficheiros, nomes_novos):
+                    storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_d}__{nome_novo}", f.getvalue())
+                    ok += 1
             msg = f"{ok} ficheiro(s) associados e guardados no arquivo."
+            if fixo and ficheiros_por_nif:
+                msg += " (substituiu os ficheiros anteriores dessa categoria, se existiam)."
             if sem_nif:
                 msg += f" Sem NIF no nome (usa o carregamento por cliente, abaixo): {', '.join(sem_nif)}"
             st.success(msg)
@@ -138,8 +149,12 @@ with tab_docs:
     def _gestor_documentos(col, rotulo: str, pasta: str, dicionario: dict, opcional: bool = False):
         """Upload (aceita vários ficheiros) + lista com botão de apagar, para
         uma categoria de documento (DMR, DRI, Retenções, IUC ou Outros) de um
-        cliente/mês. Suporta mais do que um ficheiro por cliente (ex: 2 DMRs)
-        e substituir um documento (apaga o antigo e carrega de novo)."""
+        cliente/mês. Para DMR/DRI/Retenções/IUC, carregar de novo SUBSTITUI
+        o(s) ficheiro(s) anteriores dessa categoria (não acumula testes/versões
+        antigas); se carregares vários ficheiros de uma vez, todos ficam
+        guardados (numerados). 'Outros documentos' continua aditivo, porque
+        cada nome identifica um documento diferente."""
+        fixo = pasta != "extra"
         with col:
             rotulo_campo = f"{rotulo} (PDF{', opcional' if opcional else ''})"
             up = st.file_uploader(rotulo_campo, type=["pdf"], accept_multiple_files=True,
@@ -148,10 +163,16 @@ with tab_docs:
                 ids_up = tuple(sorted(f"{f.name}_{f.size}" for f in up))
                 if st.session_state.get(f"_ss_{pasta}_proc_{mes}_{nif_doc}") != ids_up:
                     st.session_state[f"_ss_{pasta}_proc_{mes}_{nif_doc}"] = ids_up
-                    nomes_seguros = nomes_ficheiro_unicos([sanitizar_nome_ficheiro(f.name) for f in up])
-                    for f, nome_seguro in zip(up, nomes_seguros):
-                        storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_doc}__{nome_seguro}", f.getvalue())
-                    st.success(f"{len(up)} ficheiro(s) de {rotulo} guardado(s).")
+                    if fixo:
+                        for nome_antigo in dicionario.get(nif_doc, []):
+                            storage_apagar(f"ss/{mes}/{pasta}/{nif_doc}__{nome_antigo}")
+                        nomes_novos = ([f"{pasta}.pdf"] if len(up) == 1
+                                        else [f"{pasta}_{i}.pdf" for i in range(1, len(up) + 1)])
+                    else:
+                        nomes_novos = nomes_ficheiro_unicos([sanitizar_nome_ficheiro(f.name) for f in up])
+                    for f, nome_novo in zip(up, nomes_novos):
+                        storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_doc}__{nome_novo}", f.getvalue())
+                    st.success(f"{len(up)} ficheiro(s) de {rotulo} guardado(s)." + (" Substituiu os anteriores." if fixo else ""))
                     st.rerun()
             existentes = dicionario.get(nif_doc, [])
             if existentes:
@@ -174,14 +195,24 @@ with tab_docs:
 
     st.divider()
     st.markdown("**Estado do mês por cliente**")
+
+    def _marca(dicionario: dict, nif: str) -> str:
+        """✅/❌ como antes, mas junta a quantidade só quando há mais do
+        que um ficheiro (ex: '✅ (2)') — para não sobrecarregar a tabela
+        no caso normal, que é 0 ou 1 ficheiro por categoria."""
+        n = len(dicionario.get(nif, []))
+        if n == 0:
+            return "❌"
+        return "✅" if n == 1 else f"✅ ({n})"
+
     rows = []
     for _, r in base_ss.iterrows():
         rows.append({
             "N.º": r.get("Numero_Cliente", ""), "NIF": r["NIF"], "Nome": r["Nome"],
-            "DMR": "✅" if r["NIF"] in dmrs_dict else "❌",
-            "DRI": "✅" if r["NIF"] in dris_dict else "❌",
-            "Retenções": "✅" if r["NIF"] in retencoes_dict else "❌",
-            "IUC": "✅" if r["NIF"] in iuc_dict else "❌",
+            "DMR": _marca(dmrs_dict, r["NIF"]),
+            "DRI": _marca(dris_dict, r["NIF"]),
+            "Retenções": _marca(retencoes_dict, r["NIF"]),
+            "IUC": _marca(iuc_dict, r["NIF"]),
             "Extras": len(extras_dict.get(r["NIF"], [])),
             "Email Enviado": bool(r["Email_Enviado"]),
         })
@@ -331,6 +362,10 @@ with tab_emails:
 # --- Template ----------------------------------------------------------------
 with tab_template:
     st.subheader("Template do Email da Segurança Social")
+    if st.button("🔄 Repor template padrão", key="ss_tpl_reset",
+                 help="Substitui o texto atual pelo modelo mais recente (ex: lista de documentos em formato de lista)."):
+        st.session_state.template_ss = DEFAULT_TEMPLATE_SS.copy()
+        st.rerun()
     editor_template_bilingue(st.session_state.template_ss, "ss_tpl")
     st.caption(
         "Placeholders disponíveis: {nome} {nif} {email} {mes_nome} {data_limite} {lista_docs} {lista_valores}. "
