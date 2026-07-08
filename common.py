@@ -1491,7 +1491,8 @@ DEFAULT_TEMPLATE_SS = {
     "assunto": "Segurança Social — {mes_nome} — {nome}",
     "corpo": (
         "Exmo(a). Sr(a).,\n\n"
-        "Junto enviamos a documentação da Segurança Social referente a {mes_nome}: {lista_docs}.\n\n"
+        "Junto enviamos a documentação da Segurança Social referente a {mes_nome}:\n\n"
+        "{lista_docs}\n\n"
         "{lista_valores}\n\n"
         "O pagamento deverá ser efetuado até {data_limite}.\n\n"
         "Ficamos ao dispor para qualquer esclarecimento.\n\n"
@@ -1500,7 +1501,8 @@ DEFAULT_TEMPLATE_SS = {
     "assunto_en": "Social Security — {mes_nome} — {nome}",
     "corpo_en": (
         "Dear Sir or Madam,\n\n"
-        "Please find attached the Social Security documentation for {mes_nome}: {lista_docs}.\n\n"
+        "Please find attached the Social Security documentation for {mes_nome}:\n\n"
+        "{lista_docs}\n\n"
         "{lista_valores}\n\n"
         "Payment should be made by {data_limite}.\n\n"
         "We remain at your disposal for any clarification.\n\n"
@@ -1592,9 +1594,11 @@ def obter_documentos_ss(mes: str, nif: str, dmrs_dict: dict, dris_dict: dict,
     ]
     for rotulo, pasta, dicionario in categorias:
         nomes = dicionario.get(nif, [])
-        for nome in nomes:
-            base = nome.rsplit(".", 1)[0] if "." in nome else nome
-            tipo = rotulo if (len(nomes) == 1 or base.lower() == rotulo.lower()) else f"{rotulo} ({base})"
+        for i, nome in enumerate(nomes, start=1):
+            # O nome do ficheiro nunca aparece no email (só serve para
+            # associar ao NIF); se houver mais do que um na mesma categoria,
+            # numeram-se (ex: 'DMR 1', 'DMR 2') em vez de usar o nome do ficheiro.
+            tipo = rotulo if len(nomes) == 1 else f"{rotulo} {i}"
             docs.append({"tipo": tipo, "caminho": f"ss/{mes}/{pasta}/{nif}__{nome}", "anexo": nome})
     for nome_extra in extras_dict.get(nif, []):
         base = nome_extra.rsplit(".", 1)[0] if "." in nome_extra else nome_extra
@@ -1642,7 +1646,10 @@ def render_template_ss(template: dict, row: pd.Series, mes: str, docs: list, val
     usada para escrever o bloco 'X - valor€' no email quando disponível."""
     lingua = lingua_cliente(row)
     tipos = [d["tipo"] for d in docs]
-    lista_docs = ", ".join(tipos) if tipos else ("the attached documents" if lingua == "EN" else "os documentos em anexo")
+    if tipos:
+        lista_docs = "\n".join(f"• {t}" for t in tipos)
+    else:
+        lista_docs = "• " + ("the attached documents" if lingua == "EN" else "os documentos em anexo")
 
     if valores:
         cabecalho = "Amounts due" if lingua == "EN" else "Valores"
