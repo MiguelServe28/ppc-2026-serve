@@ -336,6 +336,7 @@ with tab_processar:
 
                 cc_gestor = [row_atual["Gestor_Email"]] if row_atual["Gestor_Email"] else []
                 enviar_email(smtp_cfg, row_atual["Email"], assunto, corpo, anexos, cc=cc_gestor,
+                             bcc=[smtp_cfg["remetente"]],
                              assinatura_html=st.session_state.params.get("assinatura_html", ""))
 
                 novo_irs = pd.DataFrame(st.session_state.irs_dados)
