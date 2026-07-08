@@ -1606,11 +1606,13 @@ def obter_documentos_ss(mes: str, nif: str, dmrs_dict: dict, dris_dict: dict,
     for rotulo, pasta, dicionario in categorias:
         nomes = dicionario.get(nif, [])
         for i, nome in enumerate(nomes, start=1):
-            # O nome do ficheiro nunca aparece no email (só serve para
-            # associar ao NIF); se houver mais do que um na mesma categoria,
-            # numeram-se (ex: 'DMR 1', 'DMR 2') em vez de usar o nome do ficheiro.
+            # O nome do ficheiro no Storage é sempre fixo/seguro (dmr.pdf,
+            # dmr_2.pdf, ...) para o upload seguinte substituir sozinho; o
+            # NOME DO ANEXO que o cliente vê no email é à parte, baseado na
+            # etiqueta (ex: 'DMR.pdf', 'Retenções 2.pdf'), nunca no nome
+            # original que foi carregado.
             tipo = rotulo if len(nomes) == 1 else f"{rotulo} {i}"
-            docs.append({"tipo": tipo, "caminho": f"ss/{mes}/{pasta}/{nif}__{nome}", "anexo": nome})
+            docs.append({"tipo": tipo, "caminho": f"ss/{mes}/{pasta}/{nif}__{nome}", "anexo": f"{tipo}.pdf"})
     for nome_extra in extras_dict.get(nif, []):
         base = nome_extra.rsplit(".", 1)[0] if "." in nome_extra else nome_extra
         docs.append({"tipo": base, "caminho": f"ss/{mes}/extra/{nif}__{nome_extra}", "anexo": nome_extra})
