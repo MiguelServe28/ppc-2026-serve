@@ -29,9 +29,11 @@ from common import (
     meu_email,
     montar_base_ss,
     nome_mes,
+    nomes_ficheiro_unicos,
     obter_documentos_ss,
     registar_log,
     render_template_ss,
+    sanitizar_nome_ficheiro,
     storage_apagar,
     storage_upload_pdf,
 )
@@ -79,12 +81,7 @@ with tab_docs:
     )
 
     st.markdown("**Carregamento em massa** (vários PDFs de uma vez, com o NIF no nome do ficheiro)")
-    st.caption(
-        "Todas as categorias aceitam mais do que um ficheiro para o mesmo cliente (ex: 2 DMRs) — "
-        "desde que os nomes dos ficheiros sejam diferentes. Se um cliente tiver 2 documentos da mesma "
-        "categoria, escreve algo depois do NIF para os distinguir (ex: '267894449_Entidade A.pdf' e "
-        "'267894449_Entidade B.pdf')."
-    )
+    st.caption("Se um cliente tiver 2 documentos da mesma categoria, distingue-os no nome do ficheiro (ex: '267894449_Entidade A.pdf').")
     col_tipo, col_up = st.columns([1, 3])
     with col_tipo:
         tipo_doc = st.radio(
@@ -105,6 +102,8 @@ with tab_docs:
             st.session_state["_ss_massa_proc"] = (mes, tipo_doc, ids_upload)
             pasta = PASTAS_TIPO_DOC[tipo_doc]
             ok, sem_nif = 0, []
+            itens = []  # (ficheiro, nif) por ordem, para depois desambiguar nomes repetidos
+            labels_por_nif = {}
             for f in up_massa:
                 nif_d = extrair_nif_de_filename(f.name)
                 if not nif_d:
@@ -113,6 +112,13 @@ with tab_docs:
                 label = extrair_label_extra(f.name, nif_d)
                 if tipo_doc != "Outros documentos" and label == "Documento.pdf":
                     label = f"{tipo_doc}.pdf"  # só veio o NIF no nome -> usa o próprio tipo como etiqueta
+                itens.append((f, nif_d))
+                labels_por_nif.setdefault(nif_d, []).append(label)
+            # Se dois ficheiros do MESMO cliente derem o mesmo nome (ex: duas DMRs
+            # ambas só com o NIF no nome), desambigua-se para nenhum se perder.
+            labels_unicos_por_nif = {nif: iter(nomes_ficheiro_unicos(labels)) for nif, labels in labels_por_nif.items()}
+            for f, nif_d in itens:
+                label = next(labels_unicos_por_nif[nif_d])
                 storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_d}__{label}", f.getvalue())
                 ok += 1
             msg = f"{ok} ficheiro(s) associados e guardados no arquivo."
@@ -135,15 +141,16 @@ with tab_docs:
         cliente/mês. Suporta mais do que um ficheiro por cliente (ex: 2 DMRs)
         e substituir um documento (apaga o antigo e carrega de novo)."""
         with col:
-            rotulo_campo = f"{rotulo} (PDF{', opcional' if opcional else ''} — podes carregar mais do que um)"
+            rotulo_campo = f"{rotulo} (PDF{', opcional' if opcional else ''})"
             up = st.file_uploader(rotulo_campo, type=["pdf"], accept_multiple_files=True,
                                    key=f"ss_up_{pasta}_{mes}_{nif_doc}")
             if up:
                 ids_up = tuple(sorted(f"{f.name}_{f.size}" for f in up))
                 if st.session_state.get(f"_ss_{pasta}_proc_{mes}_{nif_doc}") != ids_up:
                     st.session_state[f"_ss_{pasta}_proc_{mes}_{nif_doc}"] = ids_up
-                    for f in up:
-                        storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_doc}__{f.name}", f.getvalue())
+                    nomes_seguros = nomes_ficheiro_unicos([sanitizar_nome_ficheiro(f.name) for f in up])
+                    for f, nome_seguro in zip(up, nomes_seguros):
+                        storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_doc}__{nome_seguro}", f.getvalue())
                     st.success(f"{len(up)} ficheiro(s) de {rotulo} guardado(s).")
                     st.rerun()
             existentes = dicionario.get(nif_doc, [])
