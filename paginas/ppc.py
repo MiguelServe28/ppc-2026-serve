@@ -335,7 +335,8 @@ with tab_emails:
                         anexos.append((f"Guia_{n_pag_email}Pagamento_{nif}.pdf", guia_bytes))
                     try:
                         cc_gestor = [row["Gestor_Email"]] if row["Gestor_Email"] else []
-                        enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor, assinatura_html=assinatura)
+                        enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor,
+                                     bcc=[smtp_cfg["remetente"]], assinatura_html=assinatura)
                         idx = df_full.index[df_full["NIF"] == nif][0]
                         df_full.at[idx, f"Email{n_pag_email}_Enviado"] = True
                         registar_log(
