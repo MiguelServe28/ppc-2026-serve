@@ -99,7 +99,11 @@ with tab_docs:
         up_massa = st.file_uploader(
             "Carregar PDFs (nome a começar pelo NIF de 9 dígitos — em 'Outros documentos' o resto "
             "do nome identifica o documento, ex: '267894449_IUC.pdf')",
-            type=["pdf"], accept_multiple_files=True, key="ss_up_massa",
+            type=["pdf"], accept_multiple_files=True, key=f"ss_up_massa_{tipo_doc}",
+            # A chave inclui o tipo_doc de propósito: sem isto, o widget mantinha os
+            # ficheiros "selecionados" ao mudares de DMR para DRI/Retenções/IUC, e ao
+            # mudar o tipo, os MESMOS ficheiros eram reenviados também para a nova
+            # categoria (por isso apareciam mais anexos do que os que carregaste).
         )
     PASTAS_TIPO_DOC = {"DMR": "dmr", "DRI": "dri", "Retenções": "retencoes", "IUC": "iuc", "Outros documentos": "extra"}
     DICIONARIOS_PASTA = {"dmr": dmrs_dict, "dri": dris_dict, "retencoes": retencoes_dict,
