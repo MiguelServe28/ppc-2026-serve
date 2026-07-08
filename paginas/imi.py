@@ -25,8 +25,10 @@ from common import (
     marcar_envio_db,
     meu_email,
     montar_base_imi,
+    nomes_ficheiro_unicos,
     registar_log,
     render_template_docs,
+    sanitizar_nome_ficheiro,
     storage_download_pdf,
     storage_listar,
     storage_upload_pdf,
@@ -111,9 +113,10 @@ with tab_docs:
             ids_extras = tuple(sorted(f"{f.name}_{f.size}" for f in up_extras))
             if st.session_state.get(f"_imi_extra_proc_{periodo}_{nif_doc}") != ids_extras:
                 st.session_state[f"_imi_extra_proc_{periodo}_{nif_doc}"] = ids_extras
-                for f in up_extras:
-                    storage_upload_pdf(f"imi/{periodo}/extra/{nif_doc}__{f.name}", f.getvalue())
-                    extras_dict.setdefault(nif_doc, []).append(f.name)
+                nomes_seguros = nomes_ficheiro_unicos([sanitizar_nome_ficheiro(f.name) for f in up_extras])
+                for f, nome_seguro in zip(up_extras, nomes_seguros):
+                    storage_upload_pdf(f"imi/{periodo}/extra/{nif_doc}__{nome_seguro}", f.getvalue())
+                    extras_dict.setdefault(nif_doc, []).append(nome_seguro)
                 st.success(f"{len(up_extras)} documento(s) extra guardados.")
         n_extras = len(extras_dict.get(nif_doc, []))
         st.caption(f"📎 {n_extras} extra(s)" if n_extras else "Sem extras")
