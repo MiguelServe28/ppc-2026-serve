@@ -250,7 +250,8 @@ with tab_emails:
                         anexos.append((nome_extra, conteudo))
                 try:
                     cc_gestor = [row["Gestor_Email"]] if row["Gestor_Email"] else []
-                    enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor, assinatura_html=assinatura)
+                    enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor,
+                                 bcc=[smtp_cfg["remetente"]], assinatura_html=assinatura)
                     marcar_envio_db("imi_dados", nif, periodo, True)
                     registar_log({
                         "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif,
