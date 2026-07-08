@@ -332,7 +332,8 @@ with tab_emails:
                 assunto, corpo = render_template_ss(tpl, row, mes, docs, valores)
                 try:
                     cc_gestor = [row["Gestor_Email"]] if row["Gestor_Email"] else []
-                    enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor, assinatura_html=assinatura)
+                    enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor,
+                                 bcc=[smtp_cfg["remetente"]], assinatura_html=assinatura)
                     marcar_ss_enviado_db(nif, mes, True)
                     registar_log({
                         "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif,
