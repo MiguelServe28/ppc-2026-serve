@@ -114,7 +114,7 @@ with tab_docs:
             st.session_state["_ss_massa_proc"] = (mes, tipo_doc, ids_upload)
             pasta = PASTAS_TIPO_DOC[tipo_doc]
             fixo = pasta != "extra"  # DMR/DRI/Retenções/IUC: nome fixo -> substitui; extras: aditivo
-            ok, sem_nif = 0, []
+            ok, sem_nif, detalhes, falhas_upload = 0, [], [], []
             ficheiros_por_nif = {}
             for f in up_massa:
                 nif_d = extrair_nif_de_filename(f.name)
@@ -132,15 +132,31 @@ with tab_docs:
                     labels = [extrair_label_extra(f.name, nif_d) for f in ficheiros]
                     nomes_novos = nomes_ficheiro_unicos(labels)
                 for f, nome_novo in zip(ficheiros, nomes_novos):
-                    storage_upload_pdf(f"ss/{mes}/{pasta}/{nif_d}__{nome_novo}", f.getvalue())
-                    ok += 1
+                    caminho_novo = f"ss/{mes}/{pasta}/{nif_d}__{nome_novo}"
+                    try:
+                        storage_upload_pdf(caminho_novo, f.getvalue())
+                        detalhes.append(f"✅ {nif_d} → {caminho_novo}")
+                        ok += 1
+                    except Exception as e:
+                        falhas_upload.append(f"❌ {nif_d} → {caminho_novo}: {e}")
             msg = f"{ok} ficheiro(s) associados e guardados no arquivo."
             if fixo and ficheiros_por_nif:
                 msg += " (substituiu os ficheiros anteriores dessa categoria, se existiam)."
             if sem_nif:
                 msg += f" Sem NIF no nome (usa o carregamento por cliente, abaixo): {', '.join(sem_nif)}"
-            st.success(msg)
+            # Guarda o relatório em vez de só mostrar antes do rerun (que o faria
+            # desaparecer logo de seguida) — assim fica visível até ao próximo upload.
+            st.session_state["_ss_ultimo_upload_massa"] = {"msg": msg, "detalhes": detalhes, "falhas": falhas_upload}
             st.rerun()
+
+    ultimo_upload = st.session_state.get("_ss_ultimo_upload_massa")
+    if ultimo_upload:
+        st.success(ultimo_upload["msg"])
+        if ultimo_upload["detalhes"]:
+            with st.expander(f"Ver os {len(ultimo_upload['detalhes'])} caminho(s) exatos onde foi guardado"):
+                st.text("\n".join(ultimo_upload["detalhes"]))
+        if ultimo_upload["falhas"]:
+            st.error("Estes ficheiros FALHARAM ao guardar:\n" + "\n".join(ultimo_upload["falhas"]))
 
     st.divider()
     st.markdown("**Carregamento por cliente** (inclui outros documentos avulsos)")
