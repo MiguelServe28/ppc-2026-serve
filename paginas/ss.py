@@ -285,7 +285,7 @@ with tab_emails:
     if preview_nif:
         row = elegiveis[elegiveis["NIF"] == preview_nif].iloc[0]
         docs = obter_documentos_ss(mes, preview_nif, dmrs_dict, dris_dict, retencoes_dict, iuc_dict, extras_dict)
-        _, valores_prev = carregar_anexos_e_valores_ss(docs) if docs else ([], [])
+        anexos_prev, valores_prev = carregar_anexos_e_valores_ss(docs) if docs else ([], [])
         assunto, corpo = render_template_ss(tpl, row, mes, docs, valores_prev)
         st.text_input("Assunto (preview)", value=assunto, disabled=True)
         if row["Gestor_Email"]:
@@ -296,6 +296,18 @@ with tab_emails:
         st.caption("📎 Anexos: " + (", ".join(d["tipo"] for d in docs) if docs else "nenhum documento carregado ainda"))
         if not valores_prev and docs:
             st.caption("ℹ️ Não foi possível ler automaticamente o valor de nenhum destes documentos — confirma manualmente se precisares de indicar montantes.")
+
+        with st.expander("🔍 Diagnóstico deste cliente/mês"):
+            st.caption(f"Mês selecionado: {mes}  ·  NIF: {preview_nif}")
+            if docs:
+                nomes_descarregados = {nome for nome, _ in anexos_prev}
+                for d in docs:
+                    ok = d["anexo"] in nomes_descarregados
+                    st.text(f"{'✅' if ok else '❌ FALHOU A DESCARREGAR'}   {d['tipo']}   →   {d['caminho']}")
+                if len(nomes_descarregados) != len(docs):
+                    st.warning("Há documentos listados que falharam ao descarregar do Storage — não vão em anexo mesmo aparecendo aqui em cima. Isto ajuda a apontar exatamente onde está o problema.")
+            else:
+                st.caption("A app não encontrou NENHUM documento para este cliente neste mês (procurou em dmr, dri, retencoes, iuc e extra).")
 
         docs_prev = docs
         ja_enviado_prev = enviados.get(preview_nif, False)
