@@ -1136,7 +1136,11 @@ def storage_listar(pasta: str) -> set:
     try:
         itens = get_client().storage.from_(BUCKET_GUIAS).list(pasta)
         return {i["name"] for i in (itens or []) if i.get("name")}
-    except Exception:
+    except Exception as e:
+        # Antes ficava em silêncio (devolvia lista vazia) — o que fazia parecer
+        # que um documento "desapareceu" quando na verdade a listagem falhou
+        # (ex: erro de rede/permissões). Agora mostra-se sempre um aviso.
+        st.warning(f"Não foi possível listar os documentos em '{pasta}': {e}")
         return set()
 
 
