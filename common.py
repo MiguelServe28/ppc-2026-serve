@@ -871,6 +871,20 @@ def sanitizar_nome_ficheiro(nome: str) -> str:
     return f"{base}.{ext}"
 
 
+def sanitizar_pasta(texto: str) -> str:
+    """Torna um texto livre (ex: o 'período' escrito à mão no módulo
+    Informações, tipo 'Segurança Social | 3º Trimestre') seguro para usar
+    como nome de PASTA no Supabase Storage — mesmo princípio do
+    sanitizar_nome_ficheiro, mas sem extensão. Usado só para o caminho no
+    Storage; o texto original continua a ser guardado tal e qual na base de
+    dados e mostrado ao utilizador."""
+    if not texto:
+        return "geral"
+    base = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^A-Za-z0-9\-_]+", "_", base).strip("_")
+    return base or "geral"
+
+
 def nomes_ficheiro_unicos(nomes: list) -> list:
     """Garante que não há nomes repetidos dentro do MESMO carregamento —
     importante porque dois ficheiros com o mesmo nome (ex: duas DMRs ambas
