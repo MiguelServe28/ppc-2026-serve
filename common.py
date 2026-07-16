@@ -1491,6 +1491,127 @@ def gerar_excel_irs(base_irs: pd.DataFrame, params: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# IRS Avulso (por número) — registo TOTALMENTE À PARTE do resto da
+# plataforma, para lotes de clientes só de IRS que chegam já numerados, sem
+# NIF fiável à mão. A associação de documentos é feita pelo NÚMERO (não pelo
+# NIF nem pelo nome do ficheiro) — vive na sua própria tabela
+# (clientes_irs_avulso), com a sua própria numeração (nunca colide com o N.º
+# dos clientes normais). Documentos no Storage:
+# irs_avulso/<ano>/<categoria>/<numero>.pdf, onde <categoria> é
+# irs, liquidacao, guia, fatura ou pendentes.
+# ---------------------------------------------------------------------------
+IRS_AVULSO_COLS = [
+    "Numero", "NIF", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email",
+    "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado",
+]
+IRS_AVULSO_NUM_COLS = ["Valor_Apurado", "Valor_Pendente"]
+IRS_AVULSO_BOOL_COLS = ["Incluido_Avenca", "Email_Enviado"]
+IRS_AVULSO_COLUMN_MAP_TO_DB = {
+    "Numero": "numero", "NIF": "nif", "Nome": "nome", "Email": "email", "Lingua": "lingua",
+    "Gestor_Nome": "gestor_nome", "Gestor_Email": "gestor_email",
+    "Numero_Liquidacao": "numero_liquidacao", "Valor_Apurado": "valor_apurado",
+    "Valor_Pendente": "valor_pendente", "Incluido_Avenca": "incluido_avenca", "Email_Enviado": "email_enviado",
+}
+IRS_AVULSO_COLUMN_MAP_FROM_DB = {v: k for k, v in IRS_AVULSO_COLUMN_MAP_TO_DB.items()}
+
+PASTAS_TIPO_DOC_IRS_AVULSO = {
+    "IRS (declaração entregue)": "irs", "Liquidação": "liquidacao",
+    "Guia": "guia", "Fatura": "fatura", "Listagem de Pendentes": "pendentes",
+}
+
+
+def clean_irs_avulso_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in IRS_AVULSO_COLS:
+        if c not in df.columns:
+            if c in IRS_AVULSO_BOOL_COLS:
+                df[c] = False
+            elif c in IRS_AVULSO_NUM_COLS:
+                df[c] = 0.0
+            else:
+                df[c] = ""
+    for c in ["Numero", "NIF", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email", "Numero_Liquidacao"]:
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    for c in IRS_AVULSO_NUM_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in IRS_AVULSO_BOOL_COLS:
+        df[c] = df[c].fillna(False).astype(bool)
+    df["Lingua"] = df["Lingua"].str.upper().str[:2]
+    df.loc[~df["Lingua"].isin(["PT", "EN"]), "Lingua"] = "PT"
+    df = df[df["Numero"] != ""]
+    return df[IRS_AVULSO_COLS]
+
+
+def carregar_clientes_irs_avulso_db(ano: int) -> pd.DataFrame:
+    """Todos os clientes de IRS avulso importados para o ano indicado."""
+    client = get_client()
+    try:
+        resp = client.table("clientes_irs_avulso").select("*").eq("ano", ano).execute()
+    except Exception:
+        return pd.DataFrame(columns=IRS_AVULSO_COLS)
+    rows = resp.data or []
+    if not rows:
+        return pd.DataFrame(columns=IRS_AVULSO_COLS)
+    df = pd.DataFrame(rows).rename(columns=IRS_AVULSO_COLUMN_MAP_FROM_DB)
+    return clean_irs_avulso_df(df)
+
+
+def guardar_clientes_irs_avulso_db(df: pd.DataFrame, ano: int, numeros_antes: set = None):
+    """Grava por diferença (upsert + apaga só o que desapareceu). A chave é
+    (numero, ano) — nunca o NIF, porque estes clientes podem chegar sem NIF
+    confirmado e o que os identifica de forma fiável é o número."""
+    client = get_client()
+    df2 = clean_irs_avulso_df(df).copy()
+    if numeros_antes is None:
+        numeros_antes = set()
+    para_apagar = numeros_antes - set(df2["Numero"])
+    if para_apagar:
+        client.table("clientes_irs_avulso").delete().eq("ano", ano).in_("numero", list(para_apagar)).execute()
+    if not df2.empty:
+        df2 = df2.drop_duplicates(subset="Numero", keep="last")
+        registos = df2.rename(columns=IRS_AVULSO_COLUMN_MAP_TO_DB).to_dict("records")
+        for r in registos:
+            r["ano"] = ano
+        client.table("clientes_irs_avulso").upsert(registos, on_conflict="numero,ano").execute()
+
+
+def persistir_clientes_irs_avulso(df: pd.DataFrame, ano: int):
+    antes = clean_irs_avulso_df(st.session_state.get("irs_avulso_clientes", pd.DataFrame(columns=IRS_AVULSO_COLS)))
+    guardar_clientes_irs_avulso_db(df, ano, numeros_antes=set(antes["Numero"]))
+    st.session_state.irs_avulso_clientes = clean_irs_avulso_df(df)
+
+
+def extrair_numero_de_filename(filename: str):
+    """Lê o número do início do nome do ficheiro (ex: '1 - Guia - Miguel
+    Silva.pdf' -> '1'). Aceita '-', '_' ou espaço logo a seguir ao número."""
+    m = re.match(r"\s*(\d+)\s*[-_ ]", filename.strip())
+    return m.group(1) if m else None
+
+
+def obter_documentos_irs_avulso(ano: int, numero: str, arquivos: dict) -> list:
+    """'arquivos' é {categoria: {numero: [nome1.pdf, nome2.pdf, ...]}} — uma
+    entrada por categoria (irs, liquidacao, guia, fatura, pendentes), no
+    formato devolvido por listar_extras_generico. Suporta MAIS DO QUE UM
+    ficheiro por categoria (ex: 2 guias do mesmo cliente) — quando há mais do
+    que um, a etiqueta fica numerada (ex: 'Guia 1', 'Guia 2'), tal como já
+    acontece na Segurança Social. Devolve a lista no formato {tipo, caminho,
+    anexo} usado no resto da plataforma."""
+    ROTULOS = {"irs": "IRS", "liquidacao": "Liquidação", "guia": "Guia",
+               "fatura": "Fatura", "pendentes": "Listagem de Pendentes"}
+    docs = []
+    for pasta, rotulo in ROTULOS.items():
+        nomes = arquivos.get(pasta, {}).get(numero, [])
+        for i, nome in enumerate(nomes, start=1):
+            tipo = rotulo if len(nomes) == 1 else f"{rotulo} {i}"
+            docs.append({
+                "tipo": tipo,
+                "caminho": f"irs_avulso/{ano}/{pasta}/{numero}__{nome}",
+                "anexo": f"{tipo}.pdf",
+            })
+    return docs
+
+
+# ---------------------------------------------------------------------------
 # Segurança Social (DMR/DRI) — envio mensal de declarações e guias.
 # Estado "email enviado" guardado por cliente e por mês na tabela ss_dados.
 # Documentos no Storage: ss/<mes>/<categoria>/<nif>__<nome do ficheiro>, onde
