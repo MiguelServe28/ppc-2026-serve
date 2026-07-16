@@ -480,7 +480,7 @@ def carregar_config_db():
 def guardar_config_db(params: dict, templates: dict, template_irs: dict = None,
                       template_ss: dict = None, templates_extra: dict = None):
     """Só o admin tem permissão (RLS) para escrever a configuração global.
-    'templates_extra' = {"iva": {...}, "imi": {...}}."""
+    'templates_extra' = {"iva": {...}, "imi": {...}, "info": {...}}."""
     if not sou_admin():
         return
     params_serializ = dict(params)
@@ -545,6 +545,8 @@ def init_state():
             st.session_state.template_iva = extra.get("iva") or DEFAULT_TEMPLATE_IVA.copy()
         if "template_imi" not in st.session_state:
             st.session_state.template_imi = extra.get("imi") or DEFAULT_TEMPLATE_IMI.copy()
+        if "template_info" not in st.session_state:
+            st.session_state.template_info = extra.get("info") or DEFAULT_TEMPLATE_INFO.copy()
     # O IRS carrega-se DEPOIS dos params, porque depende do "ano dos dados".
     if "irs_dados" not in st.session_state:
         st.session_state.irs_dados = carregar_irs_db()
@@ -2023,3 +2025,114 @@ def gerar_excel_estado_mensal(titulo: str, base: pd.DataFrame, guias_set: set,
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# =============================================================================
+# Módulo "Informações" — avisos e documentos avulsos que não pertencem a
+# nenhum imposto específico (ex: valor trimestral da Segurança Social dos
+# Trabalhadores Independentes). Não tem pisco de obrigação fiscal: funciona
+# sobre todos os clientes, filtrados/escolhidos na própria página. Cada envio
+# agrupa-se por "período", texto livre definido por quem usa (ex: "2026-T3 —
+# SS Trab. Independentes"); dentro do período, cada cliente pode ter um valor
+# (opcional), uma mensagem livre (opcional) e vários documentos anexos.
+# =============================================================================
+DEFAULT_TEMPLATE_INFO = {
+    "assunto": "{periodo} — {nome}",
+    "corpo": (
+        "Exmo(a). Sr(a).,\n\n"
+        "{mensagem}\n\n"
+        "{lista_docs}\n\n"
+        "Ficamos ao dispor para qualquer esclarecimento.\n\n"
+        "Com os melhores cumprimentos,"
+    ),
+    "assunto_en": "{periodo} — {nome}",
+    "corpo_en": (
+        "Dear Sir or Madam,\n\n"
+        "{mensagem}\n\n"
+        "{lista_docs}\n\n"
+        "We remain at your disposal for any clarification.\n\n"
+        "Best regards,"
+    ),
+}
+
+
+def montar_base_info() -> pd.DataFrame:
+    """Todos os clientes (sem filtro de obrigação fiscal) — o módulo
+    'Informações' é genérico, para avisos avulsos que não pertencem a nenhum
+    imposto específico. A seleção de destinatários faz-se na própria página."""
+    return clean_clientes_df(st.session_state.clientes).copy()
+
+
+def listar_periodos_info() -> list:
+    """Períodos já usados no módulo Informações, do mais recente para trás
+    (ordem alfabética inversa — funciona bem com prefixos tipo '2026-T3')."""
+    try:
+        resp = get_client().table("info_dados").select("periodo").execute()
+        return sorted({r["periodo"] for r in (resp.data or []) if r.get("periodo")}, reverse=True)
+    except Exception:
+        return []
+
+
+def carregar_info_db(periodo: str) -> dict:
+    """Estado de cada cliente num período de Informações:
+    {nif: {"valor":, "mensagem":, "email_enviado":}}."""
+    try:
+        resp = get_client().table("info_dados").select("nif, valor, mensagem, email_enviado").eq("periodo", periodo).execute()
+        return {
+            r["nif"]: {
+                "valor": float(r.get("valor") or 0),
+                "mensagem": r.get("mensagem") or "",
+                "email_enviado": bool(r.get("email_enviado")),
+            }
+            for r in (resp.data or [])
+        }
+    except Exception:
+        return {}  # tabela ainda não criada (v14 por correr)
+
+
+def guardar_info_valores_db(df: pd.DataFrame, periodo: str):
+    """Grava (upsert) o Valor e a Mensagem de cada cliente para este período —
+    não mexe em 'Email_Enviado' (isso é gerido à parte por marcar_envio_db)."""
+    registos = [
+        {"nif": r["NIF"], "periodo": periodo, "valor": float(r["Valor"] or 0), "mensagem": str(r["Mensagem"] or "")}
+        for _, r in df.iterrows() if str(r["NIF"]).strip()
+    ]
+    if registos:
+        get_client().table("info_dados").upsert(registos, on_conflict="nif,periodo").execute()
+
+
+def obter_documentos_info(periodo: str, nif: str, extras_dict: dict) -> list:
+    """Documentos avulsos de um cliente neste período — tudo aditivo (cada
+    nome de ficheiro é um documento à parte), tal como 'Outros documentos'
+    nos outros módulos. Devolve dicts {tipo, caminho, anexo}."""
+    docs = []
+    for nome in extras_dict.get(nif, []):
+        base = nome.rsplit(".", 1)[0] if "." in nome else nome
+        docs.append({"tipo": base, "caminho": f"info/{periodo}/doc/{nif}__{nome}", "anexo": nome})
+    return docs
+
+
+def render_template_info(template: dict, row: pd.Series, periodo: str, valor: float, mensagem: str, docs: list) -> tuple[str, str]:
+    """Monta o email de Informações na língua do cliente. 'valor' fica vazio
+    no template se for 0/None; 'lista_docs' fica vazio se não houver
+    documentos anexados (não força texto tipo 'em anexo' se não há nada)."""
+    lingua = lingua_cliente(row)
+    tipos = [d["tipo"] for d in docs]
+    if tipos:
+        cabecalho = "Please find attached" if lingua == "EN" else "Segue em anexo"
+        lista_docs = f"{cabecalho}:\n" + "\n".join(f"• {t}" for t in tipos)
+    else:
+        lista_docs = ""
+
+    ctx = {
+        "nome": row["Nome"],
+        "nif": row["NIF"],
+        "email": row["Email"],
+        "periodo": periodo,
+        "valor": f"{formatar_valor(valor)} €" if valor else "",
+        "mensagem": (mensagem or "").strip(),
+        "lista_docs": lista_docs,
+    }
+    assunto = texto_template(template, "assunto", lingua).format(**ctx)
+    corpo = texto_template(template, "corpo", lingua).format(**ctx)
+    return assunto, corpo
