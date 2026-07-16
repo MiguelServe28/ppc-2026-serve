@@ -38,6 +38,7 @@ from common import (
     registar_log,
     render_template_info,
     sanitizar_nome_ficheiro,
+    sanitizar_pasta,
     storage_apagar,
     storage_download_pdf,
     storage_upload_pdf,
@@ -79,6 +80,12 @@ if not periodo:
     )
     st.stop()
 
+# O período é texto livre (pode ter espaços, acentos, "|", etc.) — guarda-se
+# tal e qual na base de dados e no email, mas para o CAMINHO no Storage
+# precisa de uma versão "limpa" (o Storage do Supabase rejeita esses
+# caracteres com erro "Invalid Key"). periodo_pasta é só para isso.
+periodo_pasta = sanitizar_pasta(periodo)
+
 # --- Filtro de destinatários -----------------------------------------------------
 with st.expander("🔎 Filtrar clientes elegíveis para este período", expanded=False):
     col_f1, col_f2, col_f3, col_f4 = st.columns(4)
@@ -103,7 +110,7 @@ if base_info.empty:
     st.warning("Nenhum cliente corresponde aos filtros escolhidos.")
     st.stop()
 
-extras_dict = listar_extras_generico(f"info/{periodo}/doc")
+extras_dict = listar_extras_generico(f"info/{periodo_pasta}/doc")
 estado_periodo = carregar_info_db(periodo)
 
 base_info = base_info.reset_index(drop=True)
@@ -176,7 +183,7 @@ with tab_docs:
                 labels = [extrair_label_extra(f.name, nif_d) for f in ficheiros]
                 nomes_novos = nomes_ficheiro_unicos(labels)
                 for f, nome_novo in zip(ficheiros, nomes_novos):
-                    caminho_novo = f"info/{periodo}/doc/{nif_d}__{nome_novo}"
+                    caminho_novo = f"info/{periodo_pasta}/doc/{nif_d}__{nome_novo}"
                     try:
                         storage_upload_pdf(caminho_novo, f.getvalue())
                         detalhes.append(f"✅ {nif_d} → {caminho_novo}")
@@ -217,7 +224,7 @@ with tab_docs:
             st.session_state[chave_proc] = ids_up
             nomes_novos = nomes_ficheiro_unicos([sanitizar_nome_ficheiro(f.name) for f in up])
             for f, nome_novo in zip(up, nomes_novos):
-                storage_upload_pdf(f"info/{periodo}/doc/{nif_doc}__{nome_novo}", f.getvalue())
+                storage_upload_pdf(f"info/{periodo_pasta}/doc/{nif_doc}__{nome_novo}", f.getvalue())
             st.success(f"{len(up)} documento(s) guardado(s).")
             st.rerun()
     existentes = extras_dict.get(nif_doc, [])
@@ -227,7 +234,7 @@ with tab_docs:
             c_nome.caption(f"📄 {nome}")
             if c_apagar.button("🗑️", key=f"info_apagar_{periodo}_{nif_doc}_{nome}",
                                 help="Apagar este documento"):
-                storage_apagar(f"info/{periodo}/doc/{nif_doc}__{nome}")
+                storage_apagar(f"info/{periodo_pasta}/doc/{nif_doc}__{nome}")
                 st.rerun()
     else:
         st.caption("Sem documentos para este cliente neste período.")
@@ -269,7 +276,7 @@ with tab_emails:
     )
     if preview_nif:
         row = elegiveis[elegiveis["NIF"] == preview_nif].iloc[0]
-        docs = obter_documentos_info(periodo, preview_nif, extras_dict)
+        docs = obter_documentos_info(periodo_pasta, preview_nif, extras_dict)
         assunto, corpo = render_template_info(tpl, row, periodo, row["Valor"], row["Mensagem"], docs)
         st.text_input("Assunto (preview)", value=assunto, disabled=True)
         if row["Gestor_Email"]:
@@ -323,7 +330,7 @@ with tab_emails:
             sucessos, falhas = 0, 0
             for i, nif in enumerate(selecionados):
                 row = elegiveis[elegiveis["NIF"] == nif].iloc[0]
-                docs = obter_documentos_info(periodo, nif, extras_dict)
+                docs = obter_documentos_info(periodo_pasta, nif, extras_dict)
                 anexos = []
                 for d in docs:
                     conteudo = storage_download_pdf(d["caminho"])
