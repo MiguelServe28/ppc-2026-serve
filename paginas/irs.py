@@ -10,6 +10,7 @@ clientes só de IRS que chegam já numerados (sem NIF fiável à mão) — vive
 numa tabela e numeração completamente separadas do resto da plataforma.
 """
 
+import re
 from datetime import date, datetime
 
 import pandas as pd
@@ -315,6 +316,8 @@ with tab_processar:
         else:
             st.caption("📋 CC: — (sem gestor definido para este cliente)")
         st.text_area("Corpo (preview)", value=corpo, height=280, disabled=True)
+        if not numero_liq_edit and not valor_edit:
+            st.caption("⚠️ Ainda não há valor apurado nem n.º de liquidação confirmados para este cliente — o email não vai afirmar nada sobre o valor (fica em branco), em vez de arriscar dizer 'sem valor a pagar' por engano.")
 
         anexos_previstos = []
         if "guia.pdf" in ficheiros_arquivo:
@@ -423,8 +426,16 @@ with tab_avulso:
                 else:
                     bruto_av = pd.read_excel(up_avulso_csv, dtype=str)
                 bruto_av.columns = [str(c).strip() for c in bruto_av.columns]
-                aliases_av = {"N.º": "Numero", "N°": "Numero", "Número": "Numero", "Nº": "Numero"}
-                bruto_av = bruto_av.rename(columns={c: aliases_av.get(c, c) for c in bruto_av.columns})
+                # Reconhece a coluna do número mesmo com nomes tipo "N.º", "Nº", "N°",
+                # "Número" — e também variações corrompidas por problemas de encoding
+                # em Excel (ex: "N.Âº"), normalizando para só as letras ASCII antes
+                # de comparar, em vez de exigir o texto exato.
+                def _normalizar_col(c):
+                    return re.sub(r"[^A-Za-z]", "", str(c)).lower()
+                nomes_numero = {"n", "no", "num", "numero", "nmero"}
+                bruto_av = bruto_av.rename(columns={
+                    c: "Numero" for c in bruto_av.columns if _normalizar_col(c) in nomes_numero
+                })
                 novos_av = clean_irs_avulso_df(bruto_av)
                 st.markdown(f"**{len(novos_av)} cliente(s) lidos do ficheiro:**")
                 st.dataframe(novos_av[["Numero", "NIF", "Nome", "Email", "Lingua"]], use_container_width=True, hide_index=True)
@@ -449,15 +460,26 @@ with tab_avulso:
 
         if not base_avulso.empty:
             st.divider()
-            st.markdown("**Clientes já importados** (edita Nome/Email/Língua/Gestor diretamente se precisares)")
+            COLS_EDIT_AV = ["Numero", "NIF", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email",
+                            "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente"]
+            st.markdown(
+                "**Clientes já importados** (edita Nome/Email/Língua/Gestor diretamente se precisares — "
+                "e também o Nº de Liquidação/Valor Apurado/Valor Pendente, para os casos em que a leitura "
+                "automática do PDF não encontrou o valor: sem isto preenchido, o email não afirma nada "
+                "sobre o valor, em vez de arriscar dizer 'sem valor a pagar' por engano)"
+            )
             edit_av = st.data_editor(
-                base_avulso[["Numero", "NIF", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email"]],
+                base_avulso[COLS_EDIT_AV],
                 use_container_width=True, hide_index=True, height=300,
                 disabled=["Numero"],
+                column_config={
+                    "Valor_Apurado": st.column_config.NumberColumn("Valor Apurado (€)", format="%.2f", step=0.01),
+                    "Valor_Pendente": st.column_config.NumberColumn("Valor Pendente (€)", format="%.2f", step=0.01),
+                },
                 key=f"editor_irs_avulso_clientes_{ano_dados}",
             )
             if st.button("💾 Guardar alterações aos clientes de IRS avulso"):
-                restante = base_avulso.drop(columns=["NIF", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email"]).merge(
+                restante = base_avulso.drop(columns=COLS_EDIT_AV[1:]).merge(
                     edit_av, on="Numero", how="left"
                 )
                 persistir_clientes_irs_avulso(clean_irs_avulso_df(restante), ano_dados)
@@ -482,6 +504,25 @@ with tab_avulso:
 
         # --- Documentos (carregamento em massa por número) -----------------
         with sub_docs:
+            total_docs_ano = sum(len(nomes) for dic in arquivos_avulso.values() for nomes in dic.values())
+            if total_docs_ano:
+                with st.expander(f"🗑️ Apagar TODOS os documentos de TODOS os clientes de {ano_dados} ({total_docs_ano})"):
+                    st.caption(
+                        "Apaga de uma vez todos os documentos (IRS, Liquidação, Guia, Fatura e Pendentes) "
+                        "de todos os clientes de IRS Avulso, só para este ano — útil para recomeçar limpo "
+                        "antes de re-testar um carregamento em massa. Não apaga os clientes em si, só os "
+                        "ficheiros."
+                    )
+                    if st.button(f"Confirmar — apagar os {total_docs_ano} documento(s) de {ano_dados}",
+                                 key=f"irs_avulso_apagar_tudo_ano_{ano_dados}", type="primary"):
+                        for pasta_x, dic_x in arquivos_avulso.items():
+                            for numero_x, nomes_x in dic_x.items():
+                                for nome_x in nomes_x:
+                                    storage_apagar(f"irs_avulso/{ano_dados}/{pasta_x}/{numero_x}__{nome_x}")
+                        st.success("Todos os documentos deste ano foram apagados.")
+                        st.rerun()
+                st.divider()
+
             st.markdown("**Carregamento em massa** (o nome do ficheiro deve começar pelo número, ex: '1 - Guia - Miguel Silva.pdf')")
             st.caption(
                 "A categoria (IRS, Liquidação, Guia, Fatura ou Listagem de Pendentes) é reconhecida "
@@ -685,6 +726,8 @@ with tab_avulso:
                     st.caption("📋 CC: — (sem gestor definido)")
                 st.text_area("Corpo (preview)", value=corpo_av, height=260, disabled=True)
                 st.caption("📎 Anexos: " + (", ".join(d["tipo"] for d in docs_prev_av) if docs_prev_av else "nenhum documento carregado ainda"))
+                if not row_prev_av["Numero_Liquidacao"] and not row_prev_av["Valor_Apurado"]:
+                    st.caption("⚠️ Ainda não há valor apurado nem n.º de liquidação confirmados para este cliente — o email não vai afirmar nada sobre o valor (fica em branco). Se já carregaste a Liquidação e não leu automaticamente, corrige o valor à mão na tabela da aba 'Importar' (em baixo, 'Clientes já importados').")
 
                 with st.expander("🔍 Diagnóstico deste cliente"):
                     if docs_prev_av:
