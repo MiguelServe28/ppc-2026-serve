@@ -16,12 +16,14 @@ import pandas as pd
 import streamlit as st
 
 from common import (
+    DEFAULT_TEMPLATE_IRS,
     IRS_COLS,
     PASTAS_TIPO_DOC_IRS_AVULSO,
     carregar_clientes_irs_avulso_db,
     clean_clientes_df,
     clean_irs_avulso_df,
     clean_irs_df,
+    detetar_categoria_irs_avulso,
     editor_template_bilingue,
     enviar_email,
     escolher_conta_email,
@@ -482,36 +484,36 @@ with tab_avulso:
         with sub_docs:
             st.markdown("**Carregamento em massa** (o nome do ficheiro deve começar pelo número, ex: '1 - Guia - Miguel Silva.pdf')")
             st.caption(
-                "Carregar um novo ficheiro para um cliente SUBSTITUI o(s) ficheiro(s) que já lá estavam "
-                "dessa categoria — não precisas de apagar antes de corrigir. Se quiseres mesmo mais do que "
-                "um ficheiro do mesmo tipo para o mesmo cliente, carrega-os todos DE UMA VEZ (ficam numerados)."
+                "A categoria (IRS, Liquidação, Guia, Fatura ou Listagem de Pendentes) é reconhecida "
+                "automaticamente pelo resto do nome do ficheiro — não precisas de escolher antes, podes "
+                "carregar tudo misturado de uma vez. Carregar um novo ficheiro para um cliente/categoria "
+                "SUBSTITUI o(s) ficheiro(s) que já lá estavam dessa categoria — não precisas de apagar "
+                "antes de corrigir. Se quiseres mesmo mais do que um ficheiro do mesmo tipo para o mesmo "
+                "cliente, carrega-os todos DE UMA VEZ (ficam numerados)."
             )
-            col_tipo_av, col_up_av2 = st.columns([1, 3])
-            with col_tipo_av:
-                tipo_doc_av = st.radio("Tipo de documento", list(PASTAS_TIPO_DOC_IRS_AVULSO.keys()), key="irs_avulso_tipo_doc")
-            with col_up_av2:
-                up_massa_av = st.file_uploader(
-                    "Carregar PDFs (nome a começar pelo número)", type=["pdf"], accept_multiple_files=True,
-                    key=f"irs_avulso_up_massa_{tipo_doc_av}",
-                    # A chave inclui o tipo de documento de propósito — mesma correção já aplicada na
-                    # Segurança Social, para o widget não reenviar os mesmos ficheiros ao trocar de categoria.
-                )
+            up_massa_av = st.file_uploader(
+                "Carregar PDFs (nome a começar pelo número; a categoria é adivinhada pelo resto do nome)",
+                type=["pdf"], accept_multiple_files=True, key="irs_avulso_up_massa",
+            )
             if up_massa_av:
                 ids_up_av = tuple(sorted(f"{f.name}_{f.size}" for f in up_massa_av))
-                if st.session_state.get("_irs_avulso_massa_proc") != (ano_dados, tipo_doc_av, ids_up_av):
-                    st.session_state["_irs_avulso_massa_proc"] = (ano_dados, tipo_doc_av, ids_up_av)
-                    pasta_av = PASTAS_TIPO_DOC_IRS_AVULSO[tipo_doc_av]
-                    ok_av, sem_numero, detalhes_av = 0, [], []
+                if st.session_state.get("_irs_avulso_massa_proc") != (ano_dados, ids_up_av):
+                    st.session_state["_irs_avulso_massa_proc"] = (ano_dados, ids_up_av)
+                    ok_av, sem_numero, sem_categoria, detalhes_av = 0, [], [], []
                     atualizacoes_liq = {}   # numero -> {"Numero_Liquidacao":..., "Valor_Apurado":...}
                     atualizacoes_pend = {}  # numero -> valor_pendente
-                    ficheiros_por_numero = {}
+                    ficheiros_por_grupo = {}  # (numero, pasta) -> [ficheiros]
                     for f in up_massa_av:
                         numero_f = extrair_numero_de_filename(f.name)
                         if not numero_f:
                             sem_numero.append(f.name)
                             continue
-                        ficheiros_por_numero.setdefault(numero_f, []).append(f)
-                    for numero_f, ficheiros in ficheiros_por_numero.items():
+                        pasta_f = detetar_categoria_irs_avulso(f.name)
+                        if not pasta_f:
+                            sem_categoria.append(f.name)
+                            continue
+                        ficheiros_por_grupo.setdefault((numero_f, pasta_f), []).append(f)
+                    for (numero_f, pasta_av), ficheiros in ficheiros_por_grupo.items():
                         # Substitui o(s) ficheiro(s) anteriores desta categoria para este número.
                         for nome_antigo in arquivos_avulso.get(pasta_av, {}).get(numero_f, []):
                             storage_apagar(f"irs_avulso/{ano_dados}/{pasta_av}/{numero_f}__{nome_antigo}")
@@ -522,7 +524,7 @@ with tab_avulso:
                             caminho_f = f"irs_avulso/{ano_dados}/{pasta_av}/{numero_f}__{nome_novo}"
                             try:
                                 storage_upload_pdf(caminho_f, conteudo_f)
-                                detalhes_av.append(f"✅ {numero_f} → {caminho_f}")
+                                detalhes_av.append(f"✅ {numero_f} ({pasta_av}) → {caminho_f}")
                                 ok_av += 1
                                 # Só tenta ler o valor automaticamente quando há um SÓ ficheiro
                                 # deste tipo para este cliente neste carregamento — com vários,
@@ -541,7 +543,7 @@ with tab_avulso:
                                     if dados_pend_av["valor_pendente"] is not None:
                                         atualizacoes_pend[numero_f] = dados_pend_av["valor_pendente"]
                             except Exception as e:
-                                detalhes_av.append(f"❌ {numero_f} → {caminho_f}: {e}")
+                                detalhes_av.append(f"❌ {numero_f} ({pasta_av}) → {caminho_f}: {e}")
 
                     # Aplica os valores lidos automaticamente (Liquidação/Pendentes) aos clientes afetados.
                     if atualizacoes_liq or atualizacoes_pend:
@@ -562,6 +564,8 @@ with tab_avulso:
                         msg_av += f" Valor pendente lido automaticamente em {len(atualizacoes_pend)} cliente(s)."
                     if sem_numero:
                         msg_av += f" Sem número no nome do ficheiro (ignorados): {', '.join(sem_numero)}"
+                    if sem_categoria:
+                        msg_av += f" Categoria não reconhecida no nome (usa o carregamento por cliente, abaixo): {', '.join(sem_categoria)}"
                     st.session_state["_irs_avulso_ultimo_upload"] = {"msg": msg_av, "detalhes": detalhes_av}
                     st.rerun()
 
@@ -673,7 +677,7 @@ with tab_avulso:
             if preview_num:
                 row_prev_av = elegiveis_av[elegiveis_av["Numero"] == preview_num].iloc[0]
                 docs_prev_av = obter_documentos_irs_avulso(ano_dados, preview_num, arquivos_avulso)
-                assunto_av, corpo_av = render_template_irs(tpl_av, row_prev_av)
+                assunto_av, corpo_av = render_template_irs(tpl_av, row_prev_av, docs_prev_av)
                 st.text_input("Assunto (preview)", value=assunto_av, disabled=True)
                 if row_prev_av["Gestor_Email"]:
                     st.caption(f"📋 CC: {row_prev_av['Gestor_Nome'] or ''} <{row_prev_av['Gestor_Email']}>")
@@ -719,7 +723,7 @@ with tab_avulso:
                             conteudo_e = storage_download_pdf(d["caminho"])
                             if conteudo_e:
                                 anexos_e.append((d["anexo"], conteudo_e))
-                        assunto_e, corpo_e = render_template_irs(tpl_av, row_e)
+                        assunto_e, corpo_e = render_template_irs(tpl_av, row_e, docs_e)
                         try:
                             cc_gestor_e = [row_e["Gestor_Email"]] if row_e["Gestor_Email"] else []
                             enviar_email(smtp_cfg_av, row_e["Email"], assunto_e, corpo_e, anexos_e, cc=cc_gestor_e,
@@ -748,12 +752,18 @@ with tab_avulso:
 with tab_template:
     st.subheader("Template do Email de Liquidação de IRS")
     st.caption("Este template é partilhado entre os clientes de IRS normais e os de IRS Avulso.")
+    if st.button("🔄 Repor template padrão", key="irs_tpl_reset",
+                 help="Substitui o texto atual pelo modelo mais recente (ex: lista de documentos anexados, no IRS Avulso)."):
+        st.session_state.template_irs = DEFAULT_TEMPLATE_IRS.copy()
+        st.rerun()
     tpl = st.session_state.template_irs
     editor_template_bilingue(tpl, "irs_tpl", altura=320)
     st.caption(
-        "Placeholders disponíveis: {nome} {nif} {email} {ref_liquidacao} {frase_valor} {frase_pendente} {ano_dados} {ano_pagamentos}. "
+        "Placeholders disponíveis: {nome} {nif} {email} {ref_liquidacao} {frase_valor} {frase_pendente} {lista_docs} {ano_dados} {ano_pagamentos}. "
         "{ref_liquidacao} já vem formatado como ', n.º de liquidação XXXX' (ou vazio, se não houver). "
         "{frase_valor} e {frase_pendente} são frases já prontas, geradas automaticamente a partir dos valores e na língua do cliente — não precisas de os escrever à mão. "
+        "{lista_docs} no IRS normal é a frase genérica sobre a guia; no IRS Avulso lista automaticamente os documentos "
+        "carregados para cada cliente (IRS, Liquidação, Guia, Fatura, Pendentes), em formato de lista por pontos. "
         "Alterações aqui ficam guardadas para toda a equipa."
     )
 
