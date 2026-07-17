@@ -1189,7 +1189,7 @@ DEFAULT_TEMPLATE_IRS = {
         "(NIF {nif}{ref_liquidacao}).\n\n"
         "{frase_valor}\n\n"
         "{frase_pendente}"
-        "Segue também em anexo a guia de pagamento, quando aplicável.\n\n"
+        "{lista_docs}\n\n"
         "Ficamos ao dispor para qualquer esclarecimento.\n\n"
         "Com os melhores cumprimentos,"
     ),
@@ -1200,7 +1200,7 @@ DEFAULT_TEMPLATE_IRS = {
         "(tax no. {nif}{ref_liquidacao}).\n\n"
         "{frase_valor}\n\n"
         "{frase_pendente}"
-        "The payment form is also attached, where applicable.\n\n"
+        "{lista_docs}\n\n"
         "We remain at your disposal for any clarification.\n\n"
         "Best regards,"
     ),
@@ -1386,7 +1386,11 @@ def extrair_dados_pendentes_irs(ficheiro_bytes: bytes) -> dict:
     return resultado
 
 
-def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
+def render_template_irs(template: dict, row: pd.Series, docs: list = None) -> tuple[str, str]:
+    """'docs' é opcional — vem de obter_documentos_irs_avulso (lista de dicts
+    com 'tipo') quando é chamado a partir do IRS Avulso, onde há vários
+    documentos por cliente e vale a pena listá-los. No IRS normal (por NIF)
+    continua sem 'docs' (None), e usa-se a frase genérica de sempre."""
     lingua = lingua_cliente(row)
     valor = row.get("Valor_Apurado", 0.0) or 0.0
     if lingua == "EN":
@@ -1425,6 +1429,13 @@ def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
     else:
         ref_liquidacao = ""
 
+    if docs:
+        cabecalho = "Please find also attached" if lingua == "EN" else "Segue também em anexo"
+        lista_docs = f"{cabecalho}:\n" + "\n".join(f"• {d['tipo']}" for d in docs)
+    else:
+        lista_docs = ("The payment form is also attached, where applicable." if lingua == "EN"
+                      else "Segue também em anexo a guia de pagamento, quando aplicável.")
+
     params = st.session_state.get("params", {})
     ctx = {
         "nome": row["Nome"],
@@ -1433,6 +1444,7 @@ def render_template_irs(template: dict, row: pd.Series) -> tuple[str, str]:
         "ref_liquidacao": ref_liquidacao,
         "frase_valor": frase_valor,
         "frase_pendente": frase_pendente,
+        "lista_docs": lista_docs,
         "ano_dados": params.get("ano_dados", 2025),
         "ano_pagamentos": params.get("ano_pagamentos", 2026),
     }
@@ -1602,6 +1614,30 @@ def extrair_numero_de_filename(filename: str):
     Silva.pdf' -> '1'). Aceita '-', '_' ou espaço logo a seguir ao número."""
     m = re.match(r"\s*(\d+)\s*[-_ ]", filename.strip())
     return m.group(1) if m else None
+
+
+_PALAVRAS_CATEGORIA_IRS_AVULSO = [
+    ("pendentes", ("pendente",)),
+    ("liquidacao", ("liquidac",)),
+    ("fatura", ("fatura",)),
+    ("guia", ("guia",)),
+    ("irs", ("declaracao", "irs")),
+]
+
+
+def detetar_categoria_irs_avulso(filename: str):
+    """Tenta adivinhar a categoria do IRS Avulso (irs/liquidacao/guia/fatura/
+    pendentes) a partir do TEXTO do nome do ficheiro (ex: '1 - Guia - Miguel
+    Silva.pdf' -> 'guia'). Usado no carregamento em massa para não ser preciso
+    escolher a categoria à mão antes de cada lote — os ficheiros podem vir
+    todos misturados de uma vez. A ordem das palavras importa (verifica-se
+    'pendente'/'liquidac' antes de 'irs', para 'Liquidação de IRS.pdf' não
+    cair na categoria errada). Devolve None se não reconhecer nada."""
+    texto = unicodedata.normalize("NFKD", filename).encode("ascii", "ignore").decode("ascii").lower()
+    for pasta, palavras in _PALAVRAS_CATEGORIA_IRS_AVULSO:
+        if any(p in texto for p in palavras):
+            return pasta
+    return None
 
 
 def obter_documentos_irs_avulso(ano: int, numero: str, arquivos: dict) -> list:
