@@ -468,8 +468,13 @@ with tab_avulso:
                 "automática do PDF não encontrou o valor: sem isto preenchido, o email não afirma nada "
                 "sobre o valor, em vez de arriscar dizer 'sem valor a pagar' por engano)"
             )
+            tabela_edit_av = base_avulso[COLS_EDIT_AV].copy()
+            # Número como inteiro só aqui na tabela (não na base) — para o clique no
+            # cabeçalho da coluna ordenar numericamente (1, 2, 10) em vez de por texto
+            # (1, 10, 100, 101...). É convertido de volta a texto antes de gravar.
+            tabela_edit_av["Numero"] = pd.to_numeric(tabela_edit_av["Numero"], errors="coerce").astype("Int64")
             edit_av = st.data_editor(
-                base_avulso[COLS_EDIT_AV],
+                tabela_edit_av,
                 use_container_width=True, hide_index=True, height=300,
                 disabled=["Numero"],
                 column_config={
@@ -479,8 +484,10 @@ with tab_avulso:
                 key=f"editor_irs_avulso_clientes_{ano_dados}",
             )
             if st.button("💾 Guardar alterações aos clientes de IRS avulso"):
+                edit_av_gravar = edit_av.copy()
+                edit_av_gravar["Numero"] = edit_av_gravar["Numero"].astype(str)
                 restante = base_avulso.drop(columns=COLS_EDIT_AV[1:]).merge(
-                    edit_av, on="Numero", how="left"
+                    edit_av_gravar, on="Numero", how="left"
                 )
                 persistir_clientes_irs_avulso(clean_irs_avulso_df(restante), ano_dados)
                 st.success("Alterações guardadas.")
