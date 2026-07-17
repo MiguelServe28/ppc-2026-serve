@@ -686,7 +686,11 @@ with tab_avulso:
             linhas_estado = []
             for _, r in base_avulso.iterrows():
                 linhas_estado.append({
-                    "Número": r["Numero"], "NIF": r["NIF"], "Nome": r["Nome"],
+                    # Número como inteiro (não texto) para poderes clicar no cabeçalho
+                    # da coluna e ordenar numericamente (1, 2, 10...), não por texto
+                    # (que puxava o "10" para antes do "2").
+                    "Número": int(r["Numero"]) if str(r["Numero"]).isdigit() else r["Numero"],
+                    "NIF": r["NIF"], "Nome": r["Nome"],
                     "IRS": _marca_av("irs", r["Numero"]),
                     "Liquidação": _marca_av("liquidacao", r["Numero"]),
                     "Guia": _marca_av("guia", r["Numero"]),
@@ -740,13 +744,35 @@ with tab_avulso:
             smtp_cfg_av = escolher_conta_email("irs_avulso")
 
             nao_enviados_av = [n for n in elegiveis_av["Numero"] if not elegiveis_av.loc[elegiveis_av["Numero"] == n, "Email_Enviado"].values[0]]
+            com_docs_av = [n for n in elegiveis_av["Numero"] if any(n in dic for dic in arquivos_avulso.values())]
+
+            st.markdown(f"📎 **{len(com_docs_av)} de {len(elegiveis_av)}** cliente(s) já têm documentos carregados para IRS Avulso {ano_dados}.")
+
+            multiselect_key_av = f"irs_avulso_selecionados_{ano_dados}"
+            col_b1_av, col_b2_av, col_b3_av = st.columns(3)
+            with col_b1_av:
+                if st.button("📎 Selecionar quem tem documentos e falta enviar", key="irs_avulso_sel_docs"):
+                    st.session_state[multiselect_key_av] = [n for n in com_docs_av if n in nao_enviados_av]
+                    st.rerun()
+            with col_b2_av:
+                if st.button("☑️ Selecionar todos por enviar", key="irs_avulso_sel_todos"):
+                    st.session_state[multiselect_key_av] = nao_enviados_av
+                    st.rerun()
+            with col_b3_av:
+                if st.button("✖️ Limpar seleção", key="irs_avulso_sel_limpar"):
+                    st.session_state[multiselect_key_av] = []
+                    st.rerun()
+
+            if multiselect_key_av not in st.session_state:
+                st.session_state[multiselect_key_av] = [n for n in com_docs_av if n in nao_enviados_av]
+
             selecionados_av = st.multiselect(
-                "Clientes selecionados para envio",
+                "Clientes selecionados para envio (podes ajustar — para enviar só um, deixa só esse)",
                 elegiveis_av["Numero"].tolist(),
-                default=nao_enviados_av,
                 format_func=lambda n: f"{n} — {elegiveis_av.loc[elegiveis_av['Numero']==n,'Nome'].values[0]}"
+                + ("" if n in com_docs_av else "  ⚠️ sem documentos")
                 + ("  ✅ já enviado" if elegiveis_av.loc[elegiveis_av["Numero"] == n, "Email_Enviado"].values[0] else ""),
-                key="irs_avulso_selecionados",
+                key=multiselect_key_av,
             )
 
             if st.button("🚀 Enviar Emails Selecionados (IRS Avulso)", type="primary", disabled=not selecionados_av):
