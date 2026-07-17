@@ -1393,20 +1393,31 @@ def render_template_irs(template: dict, row: pd.Series, docs: list = None) -> tu
     continua sem 'docs' (None), e usa-se a frase genérica de sempre."""
     lingua = lingua_cliente(row)
     valor = row.get("Valor_Apurado", 0.0) or 0.0
+    # Valor 0 é ambíguo: pode ser mesmo "sem valor a pagar/receber" (liquidação
+    # lida/confirmada), OU só o valor por omissão porque ainda ninguém confirmou
+    # nada (ex: só há uma Guia carregada, sem Liquidação). Só afirmamos "não
+    # resulta valor" quando há um indício de que a liquidação foi mesmo
+    # processada (nº de liquidação preenchido) — caso contrário, fica em
+    # branco em vez de arriscar dizer algo errado ao cliente.
+    valor_confirmado = valor != 0 or bool(row.get("Numero_Liquidacao"))
     if lingua == "EN":
         if valor > 0:
             frase_valor = f"The assessment results in an amount payable of {formatar_valor(valor)} €."
         elif valor < 0:
             frase_valor = f"The assessment results in a refund of {formatar_valor(abs(valor))} €."
-        else:
+        elif valor_confirmado:
             frase_valor = "The assessment results in no amount payable or refundable."
+        else:
+            frase_valor = ""
     else:
         if valor > 0:
             frase_valor = f"Do apuramento efetuado, resulta um valor a pagar de {formatar_valor(valor)} €."
         elif valor < 0:
             frase_valor = f"Do apuramento efetuado, resulta um valor a receber (reembolso) de {formatar_valor(abs(valor))} €."
-        else:
+        elif valor_confirmado:
             frase_valor = "Do apuramento efetuado, não resulta qualquer valor a pagar ou a receber."
+        else:
+            frase_valor = ""
 
     pendente = row.get("Valor_Pendente", 0.0) or 0.0
     if pendente > 0:
