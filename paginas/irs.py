@@ -30,14 +30,18 @@ from common import (
     escolher_conta_email,
     extrair_dados_liquidacao_irs,
     extrair_dados_pendentes_irs,
+    extrair_nif_de_filename,
     extrair_numero_de_filename,
     formatar_valor,
-    gerar_excel_irs,
+    gerar_excel_estado_mensal,
     guardar_config_db,
     ler_ficheiro_importacao,
     listar_extras_generico,
+    marcar_irs_enviado_db,
     meu_email,
+    migrar_documentos_irs_antigos,
     montar_base_irs,
+    obter_documentos_irs,
     obter_documentos_irs_avulso,
     persistir_clientes,
     persistir_clientes_irs_avulso,
@@ -55,15 +59,16 @@ ano_dados = st.session_state.params.get("ano_dados", 2025)
 st.title(f"🧾 IRS — Liquidações {ano_dados}")
 st.caption("SERVE — Contabilidade e Viabilização Empresarial")
 st.caption(
-    "Cada cliente é tratado individualmente: seleciona o cliente, carrega os documentos "
-    "(Guia, Nota de Liquidação e, se aplicável, o Controlo de Pendentes), confirma os valores "
-    "lidos automaticamente e envia o email. A guia e a fatura ficam guardadas no arquivo — não se perdem ao fechar o browser."
+    "Carrega os documentos (IRS, Liquidação, Guia, Fatura, Listagem de Pendentes) em massa ou "
+    "cliente a cliente — a categoria é reconhecida automaticamente pelo nome do ficheiro e associada "
+    "pelo NIF. O email lista os documentos anexados, sem mencionar valores. Tudo fica guardado no "
+    "arquivo — não se perde ao fechar o browser."
 )
 
 base_irs = montar_base_irs()
 
-tab_importar, tab_visao, tab_processar, tab_avulso, tab_template = st.tabs(
-    ["📥 Importar Clientes", "📊 Visão Geral", "📎 Processar Cliente", "🔢 IRS Avulso (por número)", "✏️ Template de Email"]
+tab_importar, tab_visao, tab_docs, tab_emails, tab_avulso, tab_template = st.tabs(
+    ["📥 Importar Clientes", "📊 Estado", "📎 Documentos", "✉️ Emails", "🔢 IRS Avulso (por número)", "✏️ Template de Email"]
 )
 
 # --- Importar Clientes -------------------------------------------------
@@ -114,7 +119,7 @@ with tab_importar:
         except Exception as e:
             st.error(f"Erro ao importar: {e}")
 
-# --- Visão Geral -----------------------------------------------------------
+# --- Estado -----------------------------------------------------------
 with tab_visao:
     if base_irs.empty:
         st.info("Ainda não há clientes com 'Aplica IRS' ligado — importa-os na aba 'Importar Clientes' ou ativa o interruptor na página 'Clientes'.")
@@ -131,40 +136,73 @@ with tab_visao:
         mostrados = base_irs if alvo is None else base_irs[base_irs["IRS_Avulso"] == alvo]
         st.caption(f"A mostrar {len(mostrados)} de {len(base_irs)} cliente(s) de IRS.")
 
-        show_cols = ["Numero_Cliente", "NIF", "Nome", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado"]
+        arquivos_irs = {
+            pasta: listar_extras_generico(f"irs/{ano_dados}/{pasta}")
+            for pasta in PASTAS_TIPO_DOC_IRS_AVULSO.values()
+        }
+
+        def _marca_irs(pasta: str, nif: str) -> str:
+            n = len(arquivos_irs.get(pasta, {}).get(nif, []))
+            if n == 0:
+                return "❌"
+            return "✅" if n == 1 else f"✅ ({n})"
+
+        linhas_estado_irs = []
+        for _, r in mostrados.iterrows():
+            linhas_estado_irs.append({
+                "N.º": r.get("Numero_Cliente", ""), "NIF": r["NIF"], "Nome": r["Nome"],
+                "IRS": _marca_irs("irs", r["NIF"]),
+                "Liquidação": _marca_irs("liquidacao", r["NIF"]),
+                "Guia": _marca_irs("guia", r["NIF"]),
+                "Fatura": _marca_irs("fatura", r["NIF"]),
+                "Pendentes": _marca_irs("pendentes", r["NIF"]),
+                "Incluído na Avença": bool(r["Incluido_Avenca"]),
+                "Email Enviado": bool(r["Email_Enviado"]),
+            })
         st.caption("✏️ Podes marcar/desmarcar diretamente os piscos 'Incluído na Avença' e 'Email Enviado' — carrega em Guardar no fim.")
         editado = st.data_editor(
-            mostrados[show_cols],
+            pd.DataFrame(linhas_estado_irs),
             use_container_width=True,
             hide_index=True,
             height=400,
-            disabled=["Numero_Cliente", "NIF", "Nome", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente"],
+            disabled=["N.º", "NIF", "Nome", "IRS", "Liquidação", "Guia", "Fatura", "Pendentes"],
             column_config={
-                "Numero_Cliente": st.column_config.TextColumn("N.º"),
-                "Numero_Liquidacao": st.column_config.TextColumn("Nº Liquidação"),
-                "Valor_Apurado": st.column_config.NumberColumn("Valor Apurado (€)", format="%.2f"),
-                "Valor_Pendente": st.column_config.NumberColumn("Pendente (€)", format="%.2f"),
-                "Incluido_Avenca": st.column_config.CheckboxColumn("Incluído na Avença"),
-                "Email_Enviado": st.column_config.CheckboxColumn("Email Enviado"),
+                "Incluído na Avença": st.column_config.CheckboxColumn("Incluído na Avença"),
+                "Email Enviado": st.column_config.CheckboxColumn("Email Enviado"),
             },
             key=f"editor_visao_irs_{filtro_tipo}",
         )
         if st.button("💾 Guardar piscos"):
-            novo = clean_irs_df(editado[["NIF", "Numero_Liquidacao", "Valor_Apurado", "Valor_Pendente", "Incluido_Avenca", "Email_Enviado"]])
             atual = clean_irs_df(pd.DataFrame(st.session_state.irs_dados))
-            resto = atual[~atual["NIF"].isin(set(novo["NIF"]))]
-            persistir_irs(pd.concat([resto, novo], ignore_index=True)[IRS_COLS])
+            novo = atual.copy()
+            for _, r in editado.iterrows():
+                nif_p = r["NIF"]
+                if nif_p in set(novo["NIF"]):
+                    novo.loc[novo["NIF"] == nif_p, "Incluido_Avenca"] = bool(r["Incluído na Avença"])
+                    novo.loc[novo["NIF"] == nif_p, "Email_Enviado"] = bool(r["Email Enviado"])
+                else:
+                    nova_linha = pd.DataFrame([{
+                        "NIF": nif_p, "Numero_Liquidacao": "", "Valor_Apurado": 0.0, "Valor_Pendente": 0.0,
+                        "Incluido_Avenca": bool(r["Incluído na Avença"]), "Email_Enviado": bool(r["Email Enviado"]),
+                    }])
+                    novo = pd.concat([novo, nova_linha], ignore_index=True)
+            persistir_irs(novo)
             st.success("Piscos guardados.")
             st.rerun()
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2 = st.columns(2)
         c1.metric("Clientes IRS (no filtro)", len(mostrados))
-        c2.metric("A Pagar", int((mostrados["Valor_Apurado"] > 0).sum()))
-        c3.metric("A Receber (reembolso)", int((mostrados["Valor_Apurado"] < 0).sum()))
-        c4.metric("Emails Enviados", f"{int(mostrados['Email_Enviado'].sum())} / {len(mostrados)}")
+        c2.metric("Emails Enviados", f"{int(mostrados['Email_Enviado'].sum())} / {len(mostrados)}")
 
         st.divider()
-        excel_irs = gerar_excel_irs(base_irs, st.session_state.params)
+        enviados_irs_excel = dict(zip(mostrados["NIF"], mostrados["Email_Enviado"]))
+        excel_irs = gerar_excel_estado_mensal(
+            f"Controlo IRS — {ano_dados}", mostrados,
+            arquivos_irs.get("irs", {}), arquivos_irs.get("liquidacao", {}), {}, enviados_irs_excel,
+            rotulo_guia="IRS", rotulo_decl="Liquidação",
+            extra_categorias=[("Guia", arquivos_irs.get("guia", {})), ("Fatura", arquivos_irs.get("fatura", {})),
+                               ("Pendentes", arquivos_irs.get("pendentes", {}))],
+        )
         st.download_button(
             "⬇️ Descarregar Excel de Controlo (IRS)",
             data=excel_irs,
@@ -173,218 +211,314 @@ with tab_visao:
         )
         st.caption("Clientes com email já enviado ficam destacados a verde no Excel.")
 
-# --- Processar Cliente -------------------------------------------------
-with tab_processar:
+# --- Documentos ---------------------------------------------------------
+with tab_docs:
     if base_irs.empty:
         st.info("Ainda não há clientes com 'Aplica IRS' ligado — importa-os na aba 'Importar Clientes' ou ativa o interruptor na página 'Clientes'.")
     else:
-        st.subheader("Selecionar Cliente")
-        nif_escolhido = st.selectbox(
-            "Cliente",
-            base_irs["NIF"].tolist(),
-            format_func=lambda n: f"{n} — {base_irs.loc[base_irs['NIF']==n,'Nome'].values[0]}",
-            key="irs_cliente_escolhido",
-        )
-        row_atual = base_irs[base_irs["NIF"] == nif_escolhido].iloc[0]
-        # Os documentos ficam arquivados por ano — mudar o "ano dos dados" nas
-        # Configurações muda também o arquivo consultado.
-        ficheiros_arquivo = storage_listar(f"irs/{ano_dados}/{nif_escolhido}")
+        arquivos_irs_docs = {
+            pasta: listar_extras_generico(f"irs/{ano_dados}/{pasta}")
+            for pasta in PASTAS_TIPO_DOC_IRS_AVULSO.values()
+        }
 
-        st.divider()
-        incluido_avenca = st.checkbox(
-            "Serviço de IRS incluído na avença deste cliente (não é faturado à parte — não mostra upload de fatura)",
-            value=bool(row_atual.get("Incluido_Avenca", False)),
-            key=f"incluido_avenca_{nif_escolhido}",
-        )
-
-        st.markdown("### 1. Carregar Documentos")
-        colunas_upload = st.columns(3 if incluido_avenca else 4)
-        col_g, col_l, col_p = colunas_upload[0], colunas_upload[1], colunas_upload[2]
-        col_f = colunas_upload[3] if not incluido_avenca else None
-
-        with col_g:
-            up_guia = st.file_uploader("Guia de Pagamento (PDF)", type=["pdf"], key=f"up_guia_irs_{nif_escolhido}")
-            if up_guia is not None:
-                fid = f"{up_guia.name}_{up_guia.size}"
-                if st.session_state.get(f"_guia_irs_proc_{nif_escolhido}") != fid:
-                    storage_upload_pdf(f"irs/{ano_dados}/{nif_escolhido}/guia.pdf", up_guia.getvalue())
-                    st.session_state[f"_guia_irs_proc_{nif_escolhido}"] = fid
-                    ficheiros_arquivo.add("guia.pdf")
-            tem_guia = "guia.pdf" in ficheiros_arquivo
-            st.caption("✅ Guia no arquivo" if tem_guia else "❌ Sem guia no arquivo ainda")
-
-        if col_f is not None:
-            with col_f:
-                up_fatura = st.file_uploader("Fatura do Serviço de IRS (PDF)", type=["pdf"], key=f"up_fatura_irs_{nif_escolhido}")
-                if up_fatura is not None:
-                    fid = f"{up_fatura.name}_{up_fatura.size}"
-                    if st.session_state.get(f"_fatura_irs_proc_{nif_escolhido}") != fid:
-                        storage_upload_pdf(f"irs/{ano_dados}/{nif_escolhido}/fatura.pdf", up_fatura.getvalue())
-                        st.session_state[f"_fatura_irs_proc_{nif_escolhido}"] = fid
-                        ficheiros_arquivo.add("fatura.pdf")
-                tem_fatura = "fatura.pdf" in ficheiros_arquivo
-                st.caption("✅ Fatura no arquivo" if tem_fatura else "❌ Sem fatura no arquivo ainda")
-
-        with col_l:
-            up_liq = st.file_uploader("Nota de Liquidação (PDF)", type=["pdf"], key=f"up_liq_irs_{nif_escolhido}")
-            dados_liq = None
-            if up_liq is not None:
-                dados_liq = extrair_dados_liquidacao_irs(up_liq.getvalue(), nif_esperado=nif_escolhido)
-                if dados_liq["nif_confirmado"] is False:
-                    st.warning(
-                        f"⚠️ Não encontrei o NIF do cliente selecionado ({nif_escolhido}) neste PDF. "
-                        "Confirma que carregaste o ficheiro certo."
-                    )
-                if dados_liq["valor_apurado"] is None:
-                    st.warning("Não consegui ler o valor automaticamente neste PDF — preenche manualmente abaixo.")
-                else:
-                    rotulo_legivel = {"a pagar": "a pagar", "a receber": "a receber (reembolso)", "apurado": "apurado (sem valor a pagar/receber)"}.get(dados_liq["tipo_valor"], "")
-                    st.success(f"Valor {rotulo_legivel}: {formatar_valor(abs(dados_liq['valor_apurado']))} €")
-                # Um widget com "key" só usa o "value=" passado na primeira vez que é criado — depois disso,
-                # o Streamlit mantém o que já está gravado em session_state para essa key. Por isso, sempre que
-                # detetamos um ficheiro novo (nome+tamanho diferente do último processado para este cliente),
-                # atualizamos nós próprios o session_state antes dos campos serem criados mais abaixo.
-                ficheiro_id = f"{up_liq.name}_{up_liq.size}"
-                chave_rastreio = f"_liq_processado_{nif_escolhido}"
-                if st.session_state.get(chave_rastreio) != ficheiro_id:
-                    st.session_state[chave_rastreio] = ficheiro_id
-                    if dados_liq["valor_apurado"] is not None:
-                        st.session_state[f"valor_apurado_{nif_escolhido}"] = dados_liq["valor_apurado"]
-                    if dados_liq["numero_liquidacao"]:
-                        st.session_state[f"num_liq_{nif_escolhido}"] = dados_liq["numero_liquidacao"]
-
-        with col_p:
-            up_pend = st.file_uploader("Controlo de Pendentes (PDF, opcional)", type=["pdf"], key=f"up_pend_irs_{nif_escolhido}")
-            dados_pend = None
-            if up_pend is not None:
-                dados_pend = extrair_dados_pendentes_irs(up_pend.getvalue())
-                if dados_pend["nif"] and dados_pend["nif"] != nif_escolhido:
-                    st.warning(f"⚠️ O NIF encontrado no PDF ({dados_pend['nif']}) não corresponde ao cliente selecionado ({nif_escolhido}).")
-                if dados_pend["valor_pendente"] is None:
-                    st.warning("Não consegui ler o total pendente automaticamente — preenche manualmente abaixo, se aplicável.")
-                else:
-                    st.success(f"Total pendente lido: {formatar_valor(dados_pend['valor_pendente'])} €")
-                ficheiro_id_pend = f"{up_pend.name}_{up_pend.size}"
-                chave_rastreio_pend = f"_pend_processado_{nif_escolhido}"
-                if st.session_state.get(chave_rastreio_pend) != ficheiro_id_pend:
-                    st.session_state[chave_rastreio_pend] = ficheiro_id_pend
-                    if dados_pend["valor_pendente"] is not None:
-                        st.session_state[f"valor_pendente_{nif_escolhido}"] = dados_pend["valor_pendente"]
-
-        st.divider()
-        st.markdown("### 2. Confirmar Valores (edita se necessário antes de gravar)")
-        valor_default = dados_liq["valor_apurado"] if dados_liq and dados_liq["valor_apurado"] is not None else float(row_atual["Valor_Apurado"])
-        numero_default = dados_liq["numero_liquidacao"] if dados_liq and dados_liq["numero_liquidacao"] else row_atual["Numero_Liquidacao"]
-        pendente_default = dados_pend["valor_pendente"] if dados_pend and dados_pend["valor_pendente"] is not None else float(row_atual["Valor_Pendente"])
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            numero_liq_edit = st.text_input("Nº de Liquidação (opcional)", value=numero_default, key=f"num_liq_{nif_escolhido}")
-        with c2:
-            valor_edit = st.number_input(
-                "Valor Apurado (€) — positivo = a pagar, negativo = a receber",
-                value=float(valor_default), step=0.01, format="%.2f", key=f"valor_apurado_{nif_escolhido}",
+        with st.expander("🔁 Migrar documentos antigos (Guia/Fatura carregados na versão anterior desta página)"):
+            st.caption(
+                "Antes, a Guia e a Fatura ficavam guardadas de forma diferente (uma pasta por cliente). "
+                "Se já tinhas carregado alguma antes desta atualização, usa este botão uma vez para as "
+                "trazer para o sítio novo — não apaga nem duplica nada, só reorganiza."
             )
-        with c3:
-            pendente_edit = st.number_input("Valor Pendente (€, à SERVE)", value=float(pendente_default), step=0.01, format="%.2f", key=f"valor_pendente_{nif_escolhido}")
+            if st.button("Migrar agora", key="irs_migrar_antigos"):
+                migrados = migrar_documentos_irs_antigos(ano_dados)
+                st.success(f"Migrados: {migrados['guia']} guia(s), {migrados['fatura']} fatura(s).")
+                st.rerun()
 
-        if st.button("💾 Guardar dados deste cliente"):
-            novo_irs = pd.DataFrame(st.session_state.irs_dados)
-            if nif_escolhido in novo_irs["NIF"].values:
-                novo_irs = novo_irs[novo_irs["NIF"] != nif_escolhido]
-            novo_linha = pd.DataFrame([{
-                "NIF": nif_escolhido, "Numero_Liquidacao": numero_liq_edit,
-                "Valor_Apurado": valor_edit, "Valor_Pendente": pendente_edit,
-                "Incluido_Avenca": incluido_avenca, "Email_Enviado": bool(row_atual["Email_Enviado"]),
-            }])
-            persistir_irs(pd.concat([novo_irs, novo_linha], ignore_index=True)[IRS_COLS])
-            st.success("Dados guardados.")
-            st.rerun()
+        total_docs_ano_irs = sum(len(nomes) for dic in arquivos_irs_docs.values() for nomes in dic.values())
+        if total_docs_ano_irs:
+            with st.expander(f"🗑️ Apagar TODOS os documentos de TODOS os clientes de {ano_dados} ({total_docs_ano_irs})"):
+                st.caption(
+                    "Apaga de uma vez todos os documentos (IRS, Liquidação, Guia, Fatura e Pendentes) de "
+                    "todos os clientes de IRS, só para este ano. Não apaga os clientes em si, só os ficheiros."
+                )
+                if st.button(f"Confirmar — apagar os {total_docs_ano_irs} documento(s) de {ano_dados}",
+                             key=f"irs_apagar_tudo_ano_{ano_dados}", type="primary"):
+                    for pasta_x, dic_x in arquivos_irs_docs.items():
+                        for nif_x, nomes_x in dic_x.items():
+                            for nome_x in nomes_x:
+                                storage_apagar(f"irs/{ano_dados}/{pasta_x}/{nif_x}__{nome_x}")
+                    st.success("Todos os documentos deste ano foram apagados.")
+                    st.rerun()
+            st.divider()
+
+        st.markdown("**Carregamento em massa** (o nome do ficheiro deve começar pelo NIF de 9 dígitos, ex: '123456789 - Guia - Miguel Silva.pdf')")
+        st.caption(
+            "A categoria (IRS, Liquidação, Guia, Fatura ou Listagem de Pendentes) é reconhecida "
+            "automaticamente pelo resto do nome do ficheiro — não precisas de escolher antes, podes "
+            "carregar tudo misturado de uma vez. Carregar um novo ficheiro para um cliente/categoria "
+            "SUBSTITUI o(s) ficheiro(s) que já lá estavam dessa categoria — não precisas de apagar antes "
+            "de corrigir. Se quiseres mesmo mais do que um ficheiro do mesmo tipo para o mesmo cliente, "
+            "carrega-os todos DE UMA VEZ (ficam numerados)."
+        )
+        up_massa_irs = st.file_uploader(
+            "Carregar PDFs (nome a começar pelo NIF; a categoria é adivinhada pelo resto do nome)",
+            type=["pdf"], accept_multiple_files=True, key="irs_up_massa",
+        )
+        if up_massa_irs:
+            ids_up_irs = tuple(sorted(f"{f.name}_{f.size}" for f in up_massa_irs))
+            if st.session_state.get("_irs_massa_proc") != (ano_dados, ids_up_irs):
+                st.session_state["_irs_massa_proc"] = (ano_dados, ids_up_irs)
+                ok_irs, sem_nif_irs, sem_categoria_irs, detalhes_irs = 0, [], [], []
+                ficheiros_por_grupo_irs = {}
+                for f in up_massa_irs:
+                    nif_f = extrair_nif_de_filename(f.name)
+                    if not nif_f:
+                        sem_nif_irs.append(f.name)
+                        continue
+                    pasta_f = detetar_categoria_irs_avulso(f.name)
+                    if not pasta_f:
+                        sem_categoria_irs.append(f.name)
+                        continue
+                    ficheiros_por_grupo_irs.setdefault((nif_f, pasta_f), []).append(f)
+                for (nif_f, pasta_ir), ficheiros in ficheiros_por_grupo_irs.items():
+                    for nome_antigo in arquivos_irs_docs.get(pasta_ir, {}).get(nif_f, []):
+                        storage_apagar(f"irs/{ano_dados}/{pasta_ir}/{nif_f}__{nome_antigo}")
+                    nomes_novos = ([f"{pasta_ir}.pdf"] if len(ficheiros) == 1
+                                    else [f"{pasta_ir}_{i}.pdf" for i in range(1, len(ficheiros) + 1)])
+                    for f, nome_novo in zip(ficheiros, nomes_novos):
+                        caminho_f = f"irs/{ano_dados}/{pasta_ir}/{nif_f}__{nome_novo}"
+                        try:
+                            storage_upload_pdf(caminho_f, f.getvalue())
+                            detalhes_irs.append(f"✅ {nif_f} ({pasta_ir}) → {caminho_f}")
+                            ok_irs += 1
+                        except Exception as e:
+                            detalhes_irs.append(f"❌ {nif_f} ({pasta_ir}) → {caminho_f}: {e}")
+                msg_irs = f"{ok_irs} ficheiro(s) associados e guardados no arquivo."
+                if sem_nif_irs:
+                    msg_irs += f" Sem NIF no nome (ignorados): {', '.join(sem_nif_irs)}"
+                if sem_categoria_irs:
+                    msg_irs += f" Categoria não reconhecida no nome (usa o carregamento por cliente, abaixo): {', '.join(sem_categoria_irs)}"
+                st.session_state["_irs_ultimo_upload_massa"] = {"msg": msg_irs, "detalhes": detalhes_irs}
+                st.rerun()
+
+        ultimo_irs = st.session_state.get("_irs_ultimo_upload_massa")
+        if ultimo_irs:
+            st.success(ultimo_irs["msg"])
+            if ultimo_irs["detalhes"]:
+                with st.expander(f"Ver os {len(ultimo_irs['detalhes'])} caminho(s) exatos onde foi guardado"):
+                    st.text("\n".join(ultimo_irs["detalhes"]))
 
         st.divider()
-        st.markdown("### 3. Pré-visualizar e Enviar Email")
-        tpl = st.session_state.template_irs
-        row_preview = row_atual.copy()
-        row_preview["Numero_Liquidacao"] = numero_liq_edit
-        row_preview["Valor_Apurado"] = valor_edit
-        row_preview["Valor_Pendente"] = pendente_edit
-        assunto, corpo = render_template_irs(tpl, row_preview)
+        st.markdown("**Carregamento por cliente**")
+        nif_doc_irs = st.selectbox(
+            "Cliente", base_irs["NIF"].tolist(),
+            format_func=lambda n: f"{n} — {base_irs.loc[base_irs['NIF']==n,'Nome'].values[0]}",
+            key="irs_cliente_doc",
+        )
+        total_docs_cliente_irs = sum(len(d.get(nif_doc_irs, [])) for d in arquivos_irs_docs.values())
+        if total_docs_cliente_irs:
+            with st.expander(f"🗑️ Apagar todos os documentos deste cliente ({total_docs_cliente_irs})"):
+                st.caption("Apaga TODOS os documentos (IRS, Liquidação, Guia, Fatura e Pendentes) deste cliente, só para este ano.")
+                if st.button("Confirmar — apagar tudo", key=f"irs_apagar_tudo_cliente_{ano_dados}_{nif_doc_irs}", type="primary"):
+                    for pasta_x, dic_x in arquivos_irs_docs.items():
+                        for nome_x in dic_x.get(nif_doc_irs, []):
+                            storage_apagar(f"irs/{ano_dados}/{pasta_x}/{nif_doc_irs}__{nome_x}")
+                    st.success("Documentos apagados.")
+                    st.rerun()
 
-        st.text_input("Assunto (preview)", value=assunto, disabled=True)
-        if row_atual["Gestor_Email"]:
-            st.caption(f"📋 CC: {row_atual['Gestor_Nome'] or ''} <{row_atual['Gestor_Email']}>")
-        else:
-            st.caption("📋 CC: — (sem gestor definido para este cliente)")
-        st.text_area("Corpo (preview)", value=corpo, height=280, disabled=True)
-        if not numero_liq_edit and not valor_edit:
-            st.caption("⚠️ Ainda não há valor apurado nem n.º de liquidação confirmados para este cliente — o email não vai afirmar nada sobre o valor (fica em branco), em vez de arriscar dizer 'sem valor a pagar' por engano.")
+        st.caption(
+            "📂 Carrega de uma vez TODOS os documentos deste cliente, misturados — a categoria "
+            "(IRS, Liquidação, Guia, Fatura ou Pendentes) é reconhecida automaticamente pelo nome de cada "
+            "ficheiro (não precisas de separar por tipo nem de escolher o NIF, já está selecionado acima). "
+            "Carregar de novo substitui o que já lá estava dessa categoria para este cliente."
+        )
+        up_cliente_irs = st.file_uploader(
+            "Carregar ficheiros deste cliente (todos de uma vez)",
+            type=["pdf"], accept_multiple_files=True, key=f"irs_up_cliente_{ano_dados}_{nif_doc_irs}",
+        )
+        if up_cliente_irs:
+            ids_up_cli = tuple(sorted(f"{f.name}_{f.size}" for f in up_cliente_irs))
+            chave_proc_cli = f"_irs_up_cliente_proc_{ano_dados}_{nif_doc_irs}"
+            if st.session_state.get(chave_proc_cli) != ids_up_cli:
+                st.session_state[chave_proc_cli] = ids_up_cli
+                grupos_cli = {}
+                sem_categoria_cli = []
+                for f in up_cliente_irs:
+                    pasta_f = detetar_categoria_irs_avulso(f.name)
+                    if not pasta_f:
+                        sem_categoria_cli.append(f.name)
+                        continue
+                    grupos_cli.setdefault(pasta_f, []).append(f)
+                for pasta_ir, ficheiros in grupos_cli.items():
+                    for nome_antigo in arquivos_irs_docs.get(pasta_ir, {}).get(nif_doc_irs, []):
+                        storage_apagar(f"irs/{ano_dados}/{pasta_ir}/{nif_doc_irs}__{nome_antigo}")
+                    nomes_novos = ([f"{pasta_ir}.pdf"] if len(ficheiros) == 1
+                                    else [f"{pasta_ir}_{i}.pdf" for i in range(1, len(ficheiros) + 1)])
+                    for f, nome_novo in zip(ficheiros, nomes_novos):
+                        storage_upload_pdf(f"irs/{ano_dados}/{pasta_ir}/{nif_doc_irs}__{nome_novo}", f.getvalue())
+                msg_cli = f"{sum(len(v) for v in grupos_cli.values())} ficheiro(s) guardados para este cliente."
+                if sem_categoria_cli:
+                    msg_cli += f" Categoria não reconhecida no nome (não guardados — usa a correção manual abaixo): {', '.join(sem_categoria_cli)}"
+                st.session_state["_irs_ultimo_upload_cliente"] = msg_cli
+                st.rerun()
 
-        anexos_previstos = []
-        if "guia.pdf" in ficheiros_arquivo:
-            anexos_previstos.append("Guia")
-        if up_liq is not None:
-            anexos_previstos.append("Nota de Liquidação")
-        if up_pend is not None:
-            anexos_previstos.append("Controlo de Pendentes")
-        if not incluido_avenca and "fatura.pdf" in ficheiros_arquivo:
-            anexos_previstos.append("Fatura")
-        st.caption("📎 Anexos que vão ser enviados: " + (", ".join(anexos_previstos) if anexos_previstos else "nenhum carregado ainda"))
-        if not incluido_avenca and "fatura.pdf" not in ficheiros_arquivo:
-            st.caption("⚠️ Este cliente não tem o serviço incluído na avença e ainda não carregaste a fatura — normalmente deve ir junto.")
+        ultimo_cli_irs = st.session_state.pop("_irs_ultimo_upload_cliente", None)
+        if ultimo_cli_irs:
+            st.success(ultimo_cli_irs)
 
-        if not row_atual["Email"]:
-            st.warning("Este cliente não tem email preenchido no registo central — não é possível enviar.")
+        def _documentos_irs(col, rotulo: str, pasta: str, dicionario: dict):
+            """Upload (aceita vários ficheiros) + lista com botão de apagar por
+            ficheiro, para uma categoria do IRS normal — mesmo padrão já usado
+            na Segurança Social e no IRS Avulso: carregar de novo SUBSTITUI o(s)
+            ficheiro(s) anteriores; carregar vários de uma vez mantém-nos todos
+            (numerados)."""
+            with col:
+                up = st.file_uploader(rotulo, type=["pdf"], accept_multiple_files=True,
+                                       key=f"irs_up_{pasta}_{ano_dados}_{nif_doc_irs}")
+                if up:
+                    ids_up = tuple(sorted(f"{f.name}_{f.size}" for f in up))
+                    chave_proc = f"_irs_{pasta}_proc_{ano_dados}_{nif_doc_irs}"
+                    if st.session_state.get(chave_proc) != ids_up:
+                        st.session_state[chave_proc] = ids_up
+                        for nome_antigo in dicionario.get(nif_doc_irs, []):
+                            storage_apagar(f"irs/{ano_dados}/{pasta}/{nif_doc_irs}__{nome_antigo}")
+                        nomes_novos = ([f"{pasta}.pdf"] if len(up) == 1
+                                        else [f"{pasta}_{i}.pdf" for i in range(1, len(up) + 1)])
+                        for f, nome_novo in zip(up, nomes_novos):
+                            storage_upload_pdf(f"irs/{ano_dados}/{pasta}/{nif_doc_irs}__{nome_novo}", f.getvalue())
+                        st.success(f"{len(up)} ficheiro(s) de {rotulo} guardado(s). Substituiu os anteriores.")
+                        st.rerun()
+                existentes = dicionario.get(nif_doc_irs, [])
+                if existentes:
+                    for nome in existentes:
+                        c_nome, c_apagar = st.columns([4, 1])
+                        c_nome.caption(f"📄 {nome}")
+                        if c_apagar.button("🗑️", key=f"irs_apagar_{pasta}_{ano_dados}_{nif_doc_irs}_{nome}",
+                                            help="Apagar (depois podes carregar outro em substituição)"):
+                            storage_apagar(f"irs/{ano_dados}/{pasta}/{nif_doc_irs}__{nome}")
+                            st.rerun()
+                else:
+                    st.caption(f"Sem {rotulo}")
+
+        with st.expander("✏️ Correção manual — carregar/ver por categoria, uma a uma"):
+            cols_irs = st.columns(5)
+            for col_irs, (rotulo_irs, pasta_irs2) in zip(cols_irs, PASTAS_TIPO_DOC_IRS_AVULSO.items()):
+                _documentos_irs(col_irs, rotulo_irs, pasta_irs2, arquivos_irs_docs.get(pasta_irs2, {}))
+
+# --- Emails --------------------------------------------------------------
+with tab_emails:
+    if base_irs.empty:
+        st.info("Ainda não há clientes com 'Aplica IRS' ligado — importa-os na aba 'Importar Clientes' ou ativa o interruptor na página 'Clientes'.")
+    else:
+        st.subheader(f"Enviar Emails — IRS {ano_dados}")
+        arquivos_irs_email = {
+            pasta: listar_extras_generico(f"irs/{ano_dados}/{pasta}")
+            for pasta in PASTAS_TIPO_DOC_IRS_AVULSO.values()
+        }
+        elegiveis_irs = base_irs[base_irs["Email"].str.strip() != ""].copy()
+        sem_email_irs = len(base_irs) - len(elegiveis_irs)
+        if sem_email_irs:
+            st.caption(f"⚠️ {sem_email_irs} cliente(s) sem email preenchido — não aparecem abaixo.")
+
+        tpl_irs = st.session_state.template_irs
+
+        preview_nif_irs = st.selectbox(
+            "Pré-visualizar cliente:", elegiveis_irs["NIF"].tolist(),
+            format_func=lambda n: f"{n} — {elegiveis_irs.loc[elegiveis_irs['NIF']==n,'Nome'].values[0]}",
+            key="irs_preview_email",
+        )
+        docs_prev_irs = []
+        if preview_nif_irs:
+            row_prev_irs = elegiveis_irs[elegiveis_irs["NIF"] == preview_nif_irs].iloc[0]
+            docs_prev_irs = obter_documentos_irs(ano_dados, preview_nif_irs, arquivos_irs_email)
+            assunto_irs, corpo_irs = render_template_irs(tpl_irs, row_prev_irs, docs_prev_irs)
+            st.text_input("Assunto (preview)", value=assunto_irs, disabled=True)
+            if row_prev_irs["Gestor_Email"]:
+                st.caption(f"📋 CC: {row_prev_irs['Gestor_Nome'] or ''} <{row_prev_irs['Gestor_Email']}>")
+            else:
+                st.caption("📋 CC: — (sem gestor definido)")
+            st.text_area("Corpo (preview)", value=corpo_irs, height=260, disabled=True)
+            st.caption("📎 Anexos: " + (", ".join(d["tipo"] for d in docs_prev_irs) if docs_prev_irs else "nenhum documento carregado ainda"))
+
+            with st.expander("🔍 Diagnóstico deste cliente"):
+                if docs_prev_irs:
+                    for d in docs_prev_irs:
+                        st.text(f"{d['tipo']}   →   {d['caminho']}")
+                else:
+                    st.caption("Nenhum documento encontrado para este cliente.")
 
         st.divider()
-        smtp_cfg = escolher_conta_email("irs")
+        smtp_cfg_irs = escolher_conta_email("irs")
 
-        if st.button("🚀 Enviar Email", type="primary", disabled=not row_atual["Email"]):
-            if not smtp_cfg["utilizador"] or not smtp_cfg["password"]:
+        nao_enviados_irs = [n for n in elegiveis_irs["NIF"] if not elegiveis_irs.loc[elegiveis_irs["NIF"] == n, "Email_Enviado"].values[0]]
+        com_docs_irs = [n for n in elegiveis_irs["NIF"] if any(n in dic for dic in arquivos_irs_email.values())]
+
+        st.markdown(f"📎 **{len(com_docs_irs)} de {len(elegiveis_irs)}** cliente(s) já têm documentos carregados para IRS {ano_dados}.")
+
+        multiselect_key_irs = f"irs_selecionados_{ano_dados}"
+        col_b1_irs, col_b2_irs, col_b3_irs = st.columns(3)
+        with col_b1_irs:
+            if st.button("📎 Selecionar quem tem documentos e falta enviar", key="irs_sel_docs"):
+                st.session_state[multiselect_key_irs] = [n for n in com_docs_irs if n in nao_enviados_irs]
+                st.rerun()
+        with col_b2_irs:
+            if st.button("☑️ Selecionar todos por enviar", key="irs_sel_todos"):
+                st.session_state[multiselect_key_irs] = nao_enviados_irs
+                st.rerun()
+        with col_b3_irs:
+            if st.button("✖️ Limpar seleção", key="irs_sel_limpar"):
+                st.session_state[multiselect_key_irs] = []
+                st.rerun()
+
+        if multiselect_key_irs not in st.session_state:
+            st.session_state[multiselect_key_irs] = [n for n in com_docs_irs if n in nao_enviados_irs]
+
+        selecionados_irs = st.multiselect(
+            "Clientes selecionados para envio (podes ajustar — para enviar só um, deixa só esse)",
+            elegiveis_irs["NIF"].tolist(),
+            format_func=lambda n: f"{n} — {elegiveis_irs.loc[elegiveis_irs['NIF']==n,'Nome'].values[0]}"
+            + ("" if n in com_docs_irs else "  ⚠️ sem documentos")
+            + ("  ✅ já enviado" if elegiveis_irs.loc[elegiveis_irs["NIF"] == n, "Email_Enviado"].values[0] else ""),
+            key=multiselect_key_irs,
+        )
+
+        if st.button("🚀 Enviar Emails Selecionados", type="primary", disabled=not selecionados_irs):
+            if not smtp_cfg_irs["utilizador"] or not smtp_cfg_irs["password"]:
                 st.error("Escolhe ou cria uma conta de email com utilizador e password preenchidos.")
             else:
-                try:
-                    anexos = []
-                    if "guia.pdf" in ficheiros_arquivo:
-                        conteudo = storage_download_pdf(f"irs/{ano_dados}/{nif_escolhido}/guia.pdf")
-                        if conteudo:
-                            anexos.append((f"Guia_IRS_{nif_escolhido}.pdf", conteudo))
-                    if up_liq is not None:
-                        anexos.append((up_liq.name, up_liq.getvalue()))
-                    if up_pend is not None:
-                        anexos.append((up_pend.name, up_pend.getvalue()))
-                    if not incluido_avenca and "fatura.pdf" in ficheiros_arquivo:
-                        conteudo = storage_download_pdf(f"irs/{ano_dados}/{nif_escolhido}/fatura.pdf")
-                        if conteudo:
-                            anexos.append((f"Fatura_{nif_escolhido}.pdf", conteudo))
-
-                    cc_gestor = [row_atual["Gestor_Email"]] if row_atual["Gestor_Email"] else []
-                    enviar_email(smtp_cfg, row_atual["Email"], assunto, corpo, anexos, cc=cc_gestor,
-                                 bcc=[smtp_cfg["remetente"]],
-                                 assinatura_html=st.session_state.params.get("assinatura_html", ""))
-
-                    novo_irs = pd.DataFrame(st.session_state.irs_dados)
-                    novo_irs = novo_irs[novo_irs["NIF"] != nif_escolhido]
-                    novo_linha = pd.DataFrame([{
-                        "NIF": nif_escolhido, "Numero_Liquidacao": numero_liq_edit,
-                        "Valor_Apurado": valor_edit, "Valor_Pendente": pendente_edit,
-                        "Incluido_Avenca": incluido_avenca, "Email_Enviado": True,
-                    }])
-                    persistir_irs(pd.concat([novo_irs, novo_linha], ignore_index=True)[IRS_COLS])
-
-                    registar_log({
-                        "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif_escolhido,
-                        "nome": row_atual["Nome"], "pagamento": 0, "estado": "Enviado",
-                        "modulo": "IRS", "enviado_por": meu_email(),
-                    })
-                    st.success(f"Email enviado a {row_atual['Nome']} e estado guardado.")
-                    st.rerun()
-                except Exception as e:
-                    registar_log({
-                        "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif_escolhido,
-                        "nome": row_atual["Nome"], "pagamento": 0, "estado": f"Erro: {e}",
-                        "modulo": "IRS", "enviado_por": meu_email(),
-                    })
-                    st.error(f"Erro ao enviar: {e}")
+                progress_irs = st.progress(0.0)
+                status_irs = st.empty()
+                assinatura_irs = st.session_state.params.get("assinatura_html", "")
+                sucessos_irs, falhas_irs = 0, 0
+                for i, nif_e in enumerate(selecionados_irs):
+                    row_e_irs = elegiveis_irs[elegiveis_irs["NIF"] == nif_e].iloc[0]
+                    docs_e_irs = obter_documentos_irs(ano_dados, nif_e, arquivos_irs_email)
+                    anexos_e_irs = []
+                    for d in docs_e_irs:
+                        conteudo_e_irs = storage_download_pdf(d["caminho"])
+                        if conteudo_e_irs:
+                            anexos_e_irs.append((d["anexo"], conteudo_e_irs))
+                    assunto_e_irs, corpo_e_irs = render_template_irs(tpl_irs, row_e_irs, docs_e_irs)
+                    try:
+                        cc_gestor_e_irs = [row_e_irs["Gestor_Email"]] if row_e_irs["Gestor_Email"] else []
+                        enviar_email(smtp_cfg_irs, row_e_irs["Email"], assunto_e_irs, corpo_e_irs, anexos_e_irs,
+                                     cc=cc_gestor_e_irs, bcc=[smtp_cfg_irs["remetente"]], assinatura_html=assinatura_irs)
+                        marcar_irs_enviado_db(nif_e, ano_dados, True)
+                        registar_log({
+                            "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif_e,
+                            "nome": row_e_irs["Nome"], "pagamento": 0, "estado": "Enviado",
+                            "modulo": "IRS", "enviado_por": meu_email(),
+                        })
+                        sucessos_irs += 1
+                    except Exception as e:
+                        registar_log({
+                            "data": datetime.now().strftime("%Y-%m-%d %H:%M"), "nif": nif_e,
+                            "nome": row_e_irs["Nome"], "pagamento": 0, "estado": f"Erro: {e}",
+                            "modulo": "IRS", "enviado_por": meu_email(),
+                        })
+                        falhas_irs += 1
+                    progress_irs.progress((i + 1) / len(selecionados_irs))
+                    status_irs.text(f"{i+1}/{len(selecionados_irs)} — {row_e_irs['Nome']}")
+                st.success(f"Concluído: {sucessos_irs} enviados, {falhas_irs} com erro. Estados guardados.")
+                st.rerun()
 
 # --- IRS Avulso (por número) --------------------------------------------
 with tab_avulso:
