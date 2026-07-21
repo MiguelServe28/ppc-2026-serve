@@ -1275,6 +1275,25 @@ def persistir_irs(df: pd.DataFrame):
     st.session_state.irs_dados = df
 
 
+def marcar_irs_enviado_db(nif: str, ano: int, enviado: bool = True):
+    """Marca só o 'email_enviado' de um cliente de IRS, sem tocar nos outros
+    campos (as colunas em falta ficam com o valor por omissão da tabela numa
+    linha nova, e ficam como estavam numa linha já existente) — mais leve do
+    que reler e regravar a tabela toda a cada envio."""
+    get_client().table("irs_dados").upsert(
+        {"nif": nif, "ano": ano, "email_enviado": enviado}, on_conflict="nif,ano"
+    ).execute()
+    df = clean_irs_df(pd.DataFrame(st.session_state.get("irs_dados", pd.DataFrame(columns=IRS_COLS))))
+    if nif in df["NIF"].values:
+        df.loc[df["NIF"] == nif, "Email_Enviado"] = enviado
+    else:
+        df = pd.concat([df, pd.DataFrame([{
+            "NIF": nif, "Numero_Liquidacao": "", "Valor_Apurado": 0.0,
+            "Valor_Pendente": 0.0, "Incluido_Avenca": False, "Email_Enviado": enviado,
+        }])], ignore_index=True)
+    st.session_state.irs_dados = df
+
+
 def montar_base_irs() -> pd.DataFrame:
     """Junta os clientes com 'Aplica_IRS' ligado com os respetivos dados de IRS
     (mesmo que ainda não tenham nenhum valor preenchido)."""
@@ -1578,6 +1597,11 @@ def clean_irs_avulso_df(df: pd.DataFrame) -> pd.DataFrame:
     df["Lingua"] = df["Lingua"].str.upper().str[:2]
     df.loc[~df["Lingua"].isin(["PT", "EN"]), "Lingua"] = "PT"
     df = df[df["Numero"] != ""]
+    # Ordena sempre por Número (numericamente, não como texto — senão "10"
+    # ficava antes de "2"), para a ordem das linhas ser sempre a mesma nas
+    # tabelas (importar/estado/email) em vez de ir mudando a cada consulta
+    # à base de dados (o Postgres não garante ordem sem "order by").
+    df = df.sort_values(by="Numero", key=lambda s: pd.to_numeric(s, errors="coerce")).reset_index(drop=True)
     return df[IRS_AVULSO_COLS]
 
 
@@ -1669,6 +1693,51 @@ def obter_documentos_irs_avulso(ano: int, numero: str, arquivos: dict) -> list:
             docs.append({
                 "tipo": tipo,
                 "caminho": f"irs_avulso/{ano}/{pasta}/{numero}__{nome}",
+                "anexo": f"{tipo}.pdf",
+            })
+    return docs
+
+
+def migrar_documentos_irs_antigos(ano: int) -> dict:
+    """A versão antiga da página de IRS guardava a Guia/Fatura numa pasta por
+    NIF com nomes fixos (irs/<ano>/<nif>/guia.pdf e .../fatura.pdf). A versão
+    nova organiza por categoria (irs/<ano>/guia/<nif>__guia.pdf), como o resto
+    da plataforma — para não perder documentos já carregados assim, esta
+    função migra-os para o sítio novo. Segura de correr mais do que uma vez
+    (não há nada para migrar da segunda vez em diante)."""
+    nifs = storage_listar(f"irs/{ano}")
+    migrados = {"guia": 0, "fatura": 0}
+    for nif in nifs:
+        # As pastas por categoria da convenção nova também aparecem aqui como
+        # "nomes" (irs/guia/fatura/...) — ignoram-se, não são NIFs.
+        if nif in ("irs", "liquidacao", "guia", "fatura", "pendentes"):
+            continue
+        for pasta, nome_antigo in (("guia", "guia.pdf"), ("fatura", "fatura.pdf")):
+            conteudo = storage_download_pdf(f"irs/{ano}/{nif}/{nome_antigo}")
+            if conteudo:
+                storage_upload_pdf(f"irs/{ano}/{pasta}/{nif}__{nome_antigo}", conteudo)
+                storage_apagar(f"irs/{ano}/{nif}/{nome_antigo}")
+                migrados[pasta] += 1
+    return migrados
+
+
+def obter_documentos_irs(ano: int, nif: str, arquivos: dict) -> list:
+    """Igual a obter_documentos_irs_avulso, mas para os clientes de IRS
+    normais (registo central, identificados por NIF em vez de Número) — mesmas
+    5 categorias (IRS, Liquidação, Guia, Fatura, Pendentes), mesmo suporte a
+    mais do que um ficheiro por categoria. Caminho no Storage: irs/<ano>/
+    <categoria>/<nif>__<nome> (pasta por categoria, não por cliente, para caber
+    no listar_extras_generico como o resto da plataforma)."""
+    ROTULOS = {"irs": "IRS", "liquidacao": "Liquidação", "guia": "Guia",
+               "fatura": "Fatura", "pendentes": "Listagem de Pendentes"}
+    docs = []
+    for pasta, rotulo in ROTULOS.items():
+        nomes = arquivos.get(pasta, {}).get(nif, [])
+        for i, nome in enumerate(nomes, start=1):
+            tipo = rotulo if len(nomes) == 1 else f"{rotulo} {i}"
+            docs.append({
+                "tipo": tipo,
+                "caminho": f"irs/{ano}/{pasta}/{nif}__{nome}",
                 "anexo": f"{tipo}.pdf",
             })
     return docs
