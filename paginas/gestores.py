@@ -20,13 +20,38 @@ perfis_resp = client.table("perfis").select("*").order("email").execute()
 perfis_lista = perfis_resp.data or []
 
 if perfis_lista:
-    st.dataframe(
-        pd.DataFrame(perfis_lista)[["email", "nome", "role"]].rename(
-            columns={"email": "Email", "nome": "Nome", "role": "Papel"}
-        ),
-        use_container_width=True,
-        hide_index=True,
+    df_perfis = pd.DataFrame(perfis_lista)[["id", "email", "nome", "role"]].rename(
+        columns={"email": "Email", "nome": "Nome", "role": "Papel"}
     )
+    if not SUPABASE_SERVICE_KEY:
+        st.dataframe(df_perfis.drop(columns=["id"]), use_container_width=True, hide_index=True)
+        st.caption("Falta configurar SUPABASE_SERVICE_KEY para poderes mudar o Papel de uma conta já criada.")
+    else:
+        st.caption("✏️ Podes mudar o Papel diretamente na tabela (admin ↔ gestor) — carrega em Guardar no fim.")
+        editado_perfis = st.data_editor(
+            df_perfis,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": None,
+                "Papel": st.column_config.SelectboxColumn("Papel", options=["gestor", "admin"], required=True),
+            },
+            disabled=["Email", "Nome"],
+            key="editor_perfis",
+        )
+        if st.button("💾 Guardar papéis"):
+            admin_client_papeis = get_admin_client()
+            alterados = 0
+            for _, r in editado_perfis.iterrows():
+                original = df_perfis.loc[df_perfis["id"] == r["id"], "Papel"].values[0]
+                if r["Papel"] != original:
+                    admin_client_papeis.table("perfis").update({"role": r["Papel"]}).eq("id", r["id"]).execute()
+                    alterados += 1
+            if alterados:
+                st.success(f"{alterados} conta(s) atualizada(s).")
+                st.rerun()
+            else:
+                st.info("Nenhuma alteração para guardar.")
 else:
     st.info("Ainda não há contas registadas além da tua.")
 
