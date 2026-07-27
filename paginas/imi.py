@@ -13,6 +13,7 @@ from common import (
     PRESTACOES_IMI,
     PRESTACOES_IMI_EN,
     carregar_envios_db,
+    carregar_responsaveis_imi_db,
     data_limite_imi,
     docs_ss_cliente,
     editor_template_bilingue,
@@ -21,6 +22,7 @@ from common import (
     extrair_nif_de_filename,
     gerar_excel_estado_mensal,
     guardar_config_db,
+    guardar_responsavel_imi_db,
     listar_extras_generico,
     marcar_envio_db,
     meu_email,
@@ -61,7 +63,74 @@ enviados = carregar_envios_db("imi_dados", periodo)
 base_imi = base_imi.reset_index(drop=True)
 base_imi["Email_Enviado"] = base_imi["NIF"].map(lambda n: enviados.get(n, False))
 
-tab_docs, tab_emails, tab_template = st.tabs(["📎 Documentos", "✉️ Emails", "✏️ Template de Email"])
+# Responsável (gestor do imóvel/empresa) — só do IMI, guardado numa tabela à
+# parte (não faz parte do registo central de clientes). Quando preenchido, o
+# email do IMI vai para ele em vez de ir para o próprio proprietário.
+responsaveis_imi = carregar_responsaveis_imi_db()
+base_imi["Responsavel_Nome"] = base_imi["NIF"].map(lambda n: responsaveis_imi.get(n, {}).get("nome", ""))
+base_imi["Responsavel_Email"] = base_imi["NIF"].map(lambda n: responsaveis_imi.get(n, {}).get("email", ""))
+base_imi["Destinatario_Email"] = base_imi["Responsavel_Email"].where(
+    base_imi["Responsavel_Email"].str.strip() != "", base_imi["Email"]
+)
+
+tab_dashboard, tab_docs, tab_emails, tab_template = st.tabs(
+    ["📊 Dashboard", "📎 Documentos", "✉️ Emails", "✏️ Template de Email"]
+)
+
+# --- Dashboard -----------------------------------------------------------------
+with tab_dashboard:
+    st.subheader(f"Estado dos Emails — IMI {ano_imi}")
+    st.caption(
+        "Vista rápida: para cada cliente, se o email de cada prestação já foi enviado este ano. "
+        "Para carregar documentos ou enviar emails, usa as abas 'Documentos' e 'Emails' (escolhe a prestação no topo)."
+    )
+
+    with st.expander("✏️ Responsáveis (gestão do imóvel) — a quem vai o email de cada cliente"):
+        st.caption(
+            "Só para o IMI — não altera o registo central de clientes. Quando preenches o Responsável "
+            "(ex: uma agência de gestão), o email desse cliente passa a ir só para ele, em vez de ir para "
+            "o proprietário. Deixa vazio para continuar a enviar ao próprio cliente, como sempre."
+        )
+        df_resp = base_imi[["NIF", "Nome", "Responsavel_Nome", "Responsavel_Email"]].rename(
+            columns={"Responsavel_Nome": "Responsável (nome)", "Responsavel_Email": "Responsável (email)"}
+        )
+        editado_resp = st.data_editor(
+            df_resp, use_container_width=True, hide_index=True, height=360,
+            disabled=["NIF", "Nome"], key="imi_editor_responsaveis",
+        )
+        if st.button("💾 Guardar Responsáveis", key="imi_guardar_responsaveis"):
+            alterados_resp = 0
+            for _, r in editado_resp.iterrows():
+                nome_novo = (r["Responsável (nome)"] or "").strip()
+                email_novo = (r["Responsável (email)"] or "").strip()
+                anterior_resp = responsaveis_imi.get(r["NIF"], {"nome": "", "email": ""})
+                if nome_novo != anterior_resp["nome"] or email_novo != anterior_resp["email"]:
+                    guardar_responsavel_imi_db(r["NIF"], nome_novo, email_novo)
+                    alterados_resp += 1
+            if alterados_resp:
+                st.success(f"{alterados_resp} responsável(eis) atualizado(s).")
+                st.rerun()
+            else:
+                st.info("Nenhuma alteração para guardar.")
+
+    enviados_por_prest = {p: carregar_envios_db("imi_dados", f"{ano_imi}-P{p}") for p in (1, 2, 3)}
+    linhas_dash = []
+    for _, r in base_imi.iterrows():
+        linhas_dash.append({
+            "N.º": r.get("Numero_Cliente", ""), "NIF": r["NIF"], "Nome": r["Nome"],
+            "Responsável": r["Responsavel_Nome"] or "—",
+            "Enviar para": r["Destinatario_Email"] or "⚠️ sem email",
+            PRESTACOES_IMI[1]: "✅" if enviados_por_prest[1].get(r["NIF"], False) else "❌",
+            PRESTACOES_IMI[2]: "✅" if enviados_por_prest[2].get(r["NIF"], False) else "❌",
+            PRESTACOES_IMI[3]: "✅" if enviados_por_prest[3].get(r["NIF"], False) else "❌",
+        })
+    st.dataframe(pd.DataFrame(linhas_dash), use_container_width=True, hide_index=True, height=460)
+
+    c1, c2, c3 = st.columns(3)
+    total_dash = len(base_imi)
+    c1.metric(PRESTACOES_IMI[1], f"{sum(enviados_por_prest[1].get(n, False) for n in base_imi['NIF'])} / {total_dash}")
+    c2.metric(PRESTACOES_IMI[2], f"{sum(enviados_por_prest[2].get(n, False) for n in base_imi['NIF'])} / {total_dash}")
+    c3.metric(PRESTACOES_IMI[3], f"{sum(enviados_por_prest[3].get(n, False) for n in base_imi['NIF'])} / {total_dash}")
 
 # --- Documentos --------------------------------------------------------------
 with tab_docs:
@@ -127,6 +196,7 @@ with tab_docs:
     for _, r in base_imi.iterrows():
         rows.append({
             "N.º": r.get("Numero_Cliente", ""), "NIF": r["NIF"], "Nome": r["Nome"],
+            "Responsável": r["Responsavel_Nome"] or "—",
             "Nota de cobrança": "✅" if r["NIF"] in guias_set else "❌",
             "Extras": len(extras_dict.get(r["NIF"], [])),
             "Email Enviado": bool(r["Email_Enviado"]),
@@ -135,7 +205,7 @@ with tab_docs:
     editado = st.data_editor(
         estado_df,
         use_container_width=True, hide_index=True, height=360,
-        disabled=["N.º", "NIF", "Nome", "Nota de cobrança", "Extras"],
+        disabled=["N.º", "NIF", "Nome", "Responsável", "Nota de cobrança", "Extras"],
         column_config={"Email Enviado": st.column_config.CheckboxColumn("Email Enviado")},
         key=f"imi_estado_{periodo}",
     )
@@ -158,10 +228,10 @@ with tab_docs:
 with tab_emails:
     st.subheader(f"Enviar Emails — {PRESTACOES_IMI[prestacao]} de {ano_imi}")
 
-    elegiveis = base_imi[base_imi["Email"].str.strip() != ""].copy()
+    elegiveis = base_imi[base_imi["Destinatario_Email"].str.strip() != ""].copy()
     sem_email = len(base_imi) - len(elegiveis)
     if sem_email:
-        st.caption(f"⚠️ {sem_email} cliente(s) sem email preenchido — não aparecem abaixo.")
+        st.caption(f"⚠️ {sem_email} cliente(s) sem email preenchido (nem do cliente, nem de Responsável) — não aparecem abaixo.")
 
     tpl = st.session_state.template_imi
 
@@ -187,6 +257,10 @@ with tab_emails:
         row = elegiveis[elegiveis["NIF"] == preview_nif].iloc[0]
         docs = docs_ss_cliente(periodo, preview_nif, guias_set, set(), extras_dict)
         assunto, corpo = render_template_docs(tpl, row, docs, ("nota de cobrança", "payment notice"), ctx_imi(row))
+        if row["Responsavel_Email"]:
+            st.caption(f"📧 Vai para o Responsável: {row['Responsavel_Nome'] or ''} <{row['Responsavel_Email']}> (não vai para o proprietário)")
+        else:
+            st.caption(f"📧 Vai para o proprietário: {row['Nome']} <{row['Email']}>")
         st.text_input("Assunto (preview)", value=assunto, disabled=True)
         if row["Gestor_Email"]:
             st.caption(f"📋 CC: {row['Gestor_Nome'] or ''} <{row['Gestor_Email']}>  ·  Língua: {row['Lingua']}")
@@ -250,7 +324,7 @@ with tab_emails:
                         anexos.append((nome_extra, conteudo))
                 try:
                     cc_gestor = [row["Gestor_Email"]] if row["Gestor_Email"] else []
-                    enviar_email(smtp_cfg, row["Email"], assunto, corpo, anexos, cc=cc_gestor,
+                    enviar_email(smtp_cfg, row["Destinatario_Email"], assunto, corpo, anexos, cc=cc_gestor,
                                  bcc=[smtp_cfg["remetente"]], assinatura_html=assinatura)
                     marcar_envio_db("imi_dados", nif, periodo, True)
                     registar_log({
