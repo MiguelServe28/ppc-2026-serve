@@ -2061,6 +2061,26 @@ def montar_base_imi() -> pd.DataFrame:
     return clientes[clientes["Aplica_IMI"]].copy()
 
 
+def carregar_responsaveis_imi_db() -> dict:
+    """Responsável (gestor do imóvel/empresa) por NIF — só do IMI, tabela
+    própria, não faz parte do registo central de clientes.
+    Devolve {nif: {"nome": ..., "email": ...}}."""
+    try:
+        resp = get_client().table("imi_responsaveis").select("*").execute()
+        return {
+            r["nif"]: {"nome": r.get("responsavel_nome", "") or "", "email": r.get("responsavel_email", "") or ""}
+            for r in (resp.data or [])
+        }
+    except Exception:
+        return {}  # tabela ainda não criada (v15 por correr)
+
+
+def guardar_responsavel_imi_db(nif: str, nome: str, email: str):
+    get_client().table("imi_responsaveis").upsert(
+        {"nif": nif, "responsavel_nome": nome, "responsavel_email": email}, on_conflict="nif"
+    ).execute()
+
+
 def render_template_docs(template: dict, row: pd.Series, docs: list, rotulo_principal: tuple, ctx_extra: dict) -> tuple[str, str]:
     """Render genérico para módulos de documentos (IVA/IMI): 'docs' vem de
     docs_ss_cliente; 'rotulo_principal' = (nome PT, nome EN) do documento
