@@ -91,7 +91,7 @@ if st.button("💾 Guardar configurações", type="primary"):
         p, st.session_state.templates, st.session_state.get("template_irs"),
         st.session_state.get("template_ss"),
         {"iva": st.session_state.get("template_iva"), "imi": st.session_state.get("template_imi"),
-         "info": st.session_state.get("template_info")},
+         "aimi": st.session_state.get("template_aimi"), "info": st.session_state.get("template_info")},
     )
     # O IRS trabalha por ano — se o "ano dos dados" mudou, recarrega os registos desse ano.
     st.session_state.irs_dados = carregar_irs_db(int(p["ano_dados"]))
