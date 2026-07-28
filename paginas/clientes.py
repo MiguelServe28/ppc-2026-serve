@@ -25,7 +25,7 @@ from common import (
 st.title("📋 Registo Central de Clientes")
 st.caption(
     "Esta tabela é partilhada por toda a plataforma. Os 'Tipos' são só categorização. "
-    "Os interruptores 'Aplica' são manuais e decidem em que módulos (PPC, IVA, IMI, IRS, Segurança Social) "
+    "Os interruptores 'Aplica' são manuais e decidem em que módulos (PPC, IVA, IMI, AIMI, IRS, Segurança Social) "
     "este cliente aparece — um cliente pode ter vários ligados ao mesmo tempo."
 )
 if not sou_admin():
@@ -85,6 +85,7 @@ FILTROS_IMPOSTO = {
     "Só PPC": "Aplica_PPC",
     "Só IVA": "Aplica_IVA",
     "Só IMI": "Aplica_IMI",
+    "Só AIMI": "Aplica_AIMI",
     "Só IRS": "Aplica_IRS",
     "Só Segurança Social": "Aplica_SS",
     "Sem nenhum imposto atribuído": "__nenhum__",
@@ -110,7 +111,7 @@ if coluna_filtro is None:
     clientes_mostrados = todos_clientes
 elif coluna_filtro == "__nenhum__":
     nenhum_aplica = ~(todos_clientes["Aplica_PPC"] | todos_clientes["Aplica_IVA"] | todos_clientes["Aplica_IMI"]
-                       | todos_clientes["Aplica_IRS"] | todos_clientes["Aplica_SS"])
+                       | todos_clientes["Aplica_AIMI"] | todos_clientes["Aplica_IRS"] | todos_clientes["Aplica_SS"])
     clientes_mostrados = todos_clientes[nenhum_aplica]
 else:
     clientes_mostrados = todos_clientes[todos_clientes[coluna_filtro]]
@@ -142,6 +143,7 @@ col_config = {
     "Aplica_PPC": st.column_config.CheckboxColumn("PPC"),
     "Aplica_IVA": st.column_config.CheckboxColumn("IVA"),
     "Aplica_IMI": st.column_config.CheckboxColumn("IMI"),
+    "Aplica_AIMI": st.column_config.CheckboxColumn("AIMI"),
     "Aplica_IRS": st.column_config.CheckboxColumn("IRS"),
     "Aplica_SS": st.column_config.CheckboxColumn("Seg. Social"),
 }
