@@ -298,5 +298,5 @@ guardar_config_db(
     st.session_state.params, st.session_state.templates,
     st.session_state.get("template_irs"), st.session_state.get("template_ss"),
     {"iva": st.session_state.get("template_iva"), "imi": st.session_state.get("template_imi"),
-     "info": st.session_state.get("template_info")},
+     "aimi": st.session_state.get("template_aimi"), "info": st.session_state.get("template_info")},
 )
