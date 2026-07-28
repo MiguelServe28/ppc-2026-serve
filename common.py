@@ -33,11 +33,11 @@ from supabase import Client, create_client
 CLIENT_COLS = [
     "NIF", "Numero_Cliente", "Nome", "Email", "Lingua", "Gestor_Nome", "Gestor_Email",
     "Tipo_Empresa", "Tipo_AL", "Tipo_Trab_Independente", "Tipo_Rep_Fiscal",
-    "Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_IRS", "Aplica_SS",
+    "Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_AIMI", "Aplica_IRS", "Aplica_SS",
     "IVA_Regime", "IRS_Avulso", "Notas",
 ]
 TIPO_COLS = ["Tipo_Empresa", "Tipo_AL", "Tipo_Trab_Independente", "Tipo_Rep_Fiscal"]
-APLICA_COLS = ["Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_IRS", "Aplica_SS"]
+APLICA_COLS = ["Aplica_PPC", "Aplica_IVA", "Aplica_IMI", "Aplica_AIMI", "Aplica_IRS", "Aplica_SS"]
 # IRS_Avulso: cliente importado apenas pelo menu do IRS (não é cliente de avença
 # da base central) — permite separar "avença" de "só IRS" na Visão Geral do IRS.
 BOOL_COLS = TIPO_COLS + APLICA_COLS + ["IRS_Avulso"]
@@ -51,7 +51,7 @@ COLUMN_MAP_TO_DB = {
     "Tipo_Empresa": "tipo_empresa", "Tipo_AL": "tipo_al",
     "Tipo_Trab_Independente": "tipo_trabalhador_independente", "Tipo_Rep_Fiscal": "tipo_representacao_fiscal",
     "Aplica_PPC": "aplica_ppc", "Aplica_IVA": "aplica_iva", "Aplica_IMI": "aplica_imi",
-    "Aplica_IRS": "aplica_irs", "Aplica_SS": "aplica_ss",
+    "Aplica_AIMI": "aplica_aimi", "Aplica_IRS": "aplica_irs", "Aplica_SS": "aplica_ss",
     "IVA_Regime": "iva_regime", "IRS_Avulso": "irs_avulso", "Notas": "notas",
 }
 COLUMN_MAP_FROM_DB = {v: k for k, v in COLUMN_MAP_TO_DB.items()}
@@ -545,6 +545,8 @@ def init_state():
             st.session_state.template_iva = extra.get("iva") or DEFAULT_TEMPLATE_IVA.copy()
         if "template_imi" not in st.session_state:
             st.session_state.template_imi = extra.get("imi") or DEFAULT_TEMPLATE_IMI.copy()
+        if "template_aimi" not in st.session_state:
+            st.session_state.template_aimi = extra.get("aimi") or DEFAULT_TEMPLATE_AIMI.copy()
         if "template_info" not in st.session_state:
             st.session_state.template_info = extra.get("info") or DEFAULT_TEMPLATE_INFO.copy()
     # O IRS carrega-se DEPOIS dos params, porque depende do "ano dos dados".
@@ -1986,6 +1988,27 @@ DEFAULT_TEMPLATE_IMI = {
     ),
 }
 
+# AIMI (Adicional ao IMI) — ao contrário do IMI, paga-se numa única vez por
+# ano (não há prestações), com prazo até 30 de setembro.
+DEFAULT_TEMPLATE_AIMI = {
+    "assunto": "AIMI {ano} — {nome}",
+    "corpo": (
+        "Exmo(a). Sr(a).,\n\n"
+        "Junto enviamos a documentação do Adicional ao IMI (AIMI) de {ano}: {lista_docs}.\n\n"
+        "O pagamento deverá ser efetuado até {data_limite}.\n\n"
+        "Ficamos ao dispor para qualquer esclarecimento.\n\n"
+        "Com os melhores cumprimentos,"
+    ),
+    "assunto_en": "Additional Municipal Property Tax (AIMI) {ano} — {nome}",
+    "corpo_en": (
+        "Dear Sir or Madam,\n\n"
+        "Please find attached the Additional Municipal Property Tax (AIMI) documentation for {ano}: {lista_docs}.\n\n"
+        "Payment should be made by {data_limite}.\n\n"
+        "We remain at your disposal for any clarification.\n\n"
+        "Best regards,"
+    ),
+}
+
 
 def lista_periodos_iva(regime: str, quantos: int = 12) -> list:
     """Períodos de IVA disponíveis no seletor, do mais recente para trás."""
@@ -2035,6 +2058,12 @@ def data_limite_imi(ano: int, prestacao: int) -> date:
     return {1: date(ano, 5, 31), 2: date(ano, 8, 31), 3: date(ano, 11, 30)}[prestacao]
 
 
+def data_limite_aimi(ano: int) -> date:
+    """AIMI paga-se de uma vez, até 30 de setembro (confirma sempre a data
+    exata na nota de cobrança/aviso da Autoridade Tributária)."""
+    return date(ano, 9, 30)
+
+
 def carregar_envios_db(tabela: str, periodo: str) -> dict:
     """Estado 'email enviado' por NIF num período (tabelas iva_dados/imi_dados)."""
     try:
@@ -2059,6 +2088,11 @@ def montar_base_iva(regime: str) -> pd.DataFrame:
 def montar_base_imi() -> pd.DataFrame:
     clientes = clean_clientes_df(st.session_state.clientes)
     return clientes[clientes["Aplica_IMI"]].copy()
+
+
+def montar_base_aimi() -> pd.DataFrame:
+    clientes = clean_clientes_df(st.session_state.clientes)
+    return clientes[clientes["Aplica_AIMI"]].copy()
 
 
 def carregar_responsaveis_imi_db() -> dict:
