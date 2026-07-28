@@ -48,6 +48,7 @@ paginas = {
         st.Page("paginas/iva.py", title="IVA", icon="🧾"),
         st.Page("paginas/irs.py", title="IRS", icon="🗂️"),
         st.Page("paginas/imi.py", title="IMI", icon="🏠"),
+        st.Page("paginas/aimi.py", title="AIMI", icon="🏘️"),
         st.Page("paginas/ss.py", title="Segurança Social", icon="🏛️"),
         st.Page("paginas/informacoes.py", title="Informações", icon="ℹ️"),
     ],
