@@ -116,10 +116,16 @@ with tab_docs:
             fixo = pasta != "extra"  # DMR/DRI/Retenções/IUC: nome fixo -> substitui; extras: aditivo
             ok, sem_nif, detalhes, falhas_upload = 0, [], [], []
             ficheiros_por_nif = {}
+            pendentes_key = f"_ss_sem_nif_{mes}"
+            pendentes = st.session_state.setdefault(pendentes_key, [])
             for f in up_massa:
                 nif_d = extrair_nif_de_filename(f.name)
                 if not nif_d:
                     sem_nif.append(f.name)
+                    # Guarda o ficheiro (com o conteúdo) para associação manual
+                    # abaixo — não é preciso ir procurá-lo outra vez no computador.
+                    if not any(p["nome"] == f.name and len(p["bytes"]) == f.size for p in pendentes):
+                        pendentes.append({"nome": f.name, "bytes": f.getvalue(), "pasta": pasta})
                     continue
                 ficheiros_por_nif.setdefault(nif_d, []).append(f)
             for nif_d, ficheiros in ficheiros_por_nif.items():
@@ -143,7 +149,7 @@ with tab_docs:
             if fixo and ficheiros_por_nif:
                 msg += " (substituiu os ficheiros anteriores dessa categoria, se existiam)."
             if sem_nif:
-                msg += f" Sem NIF no nome (usa o carregamento por cliente, abaixo): {', '.join(sem_nif)}"
+                msg += f" Sem NIF de 9 dígitos no nome (associa manualmente na secção abaixo): {', '.join(sem_nif)}"
             # Guarda o relatório em vez de só mostrar antes do rerun (que o faria
             # desaparecer logo de seguida) — assim fica visível até ao próximo upload.
             st.session_state["_ss_ultimo_upload_massa"] = {"msg": msg, "detalhes": detalhes, "falhas": falhas_upload}
@@ -157,6 +163,43 @@ with tab_docs:
                 st.text("\n".join(ultimo_upload["detalhes"]))
         if ultimo_upload["falhas"]:
             st.error("Estes ficheiros FALHARAM ao guardar:\n" + "\n".join(ultimo_upload["falhas"]))
+
+    pendentes_sem_nif = st.session_state.get(f"_ss_sem_nif_{mes}", [])
+    if pendentes_sem_nif:
+        st.warning(
+            f"⚠️ {len(pendentes_sem_nif)} ficheiro(s) sem NIF de 9 dígitos no nome (ex: quando o ficheiro "
+            "vem só com uma alcunha do cliente, tipo 'DMR_DUC_Crispim'). Escolhe o cliente e a categoria "
+            "certos para cada um — não é preciso voltar a carregar o ficheiro."
+        )
+        for i, pend in enumerate(list(pendentes_sem_nif)):
+            with st.container(border=True):
+                c_nome, c_cat, c_cli, c_btn, c_del = st.columns([2.2, 1.4, 2.6, 1, 0.6])
+                c_nome.caption(f"📄 {pend['nome']}")
+                cat_escolhida = c_cat.selectbox(
+                    "Categoria", list(PASTAS_TIPO_DOC.keys()),
+                    index=list(PASTAS_TIPO_DOC.values()).index(pend["pasta"]),
+                    key=f"ss_sem_nif_cat_{mes}_{i}", label_visibility="collapsed",
+                )
+                nif_escolhido_manual = c_cli.selectbox(
+                    "Cliente", base_ss["NIF"].tolist(),
+                    format_func=lambda n: f"{n} — {base_ss.loc[base_ss['NIF']==n,'Nome'].values[0]}",
+                    key=f"ss_sem_nif_cli_{mes}_{i}", label_visibility="collapsed",
+                )
+                if c_btn.button("✅ Associar", key=f"ss_sem_nif_ok_{mes}_{i}"):
+                    pasta_escolhida = PASTAS_TIPO_DOC[cat_escolhida]
+                    if pasta_escolhida != "extra":
+                        for nome_antigo in DICIONARIOS_PASTA[pasta_escolhida].get(nif_escolhido_manual, []):
+                            storage_apagar(f"ss/{mes}/{pasta_escolhida}/{nif_escolhido_manual}__{nome_antigo}")
+                        nome_novo = f"{pasta_escolhida}.pdf"
+                    else:
+                        nome_novo = nomes_ficheiro_unicos([sanitizar_nome_ficheiro(pend["nome"])])[0]
+                    storage_upload_pdf(f"ss/{mes}/{pasta_escolhida}/{nif_escolhido_manual}__{nome_novo}", pend["bytes"])
+                    st.session_state[f"_ss_sem_nif_{mes}"].pop(i)
+                    st.success(f"{pend['nome']} associado a {nif_escolhido_manual}.")
+                    st.rerun()
+                if c_del.button("🗑️", key=f"ss_sem_nif_del_{mes}_{i}", help="Descartar sem guardar"):
+                    st.session_state[f"_ss_sem_nif_{mes}"].pop(i)
+                    st.rerun()
 
     st.divider()
     st.markdown("**Carregamento por cliente** (inclui outros documentos avulsos)")
